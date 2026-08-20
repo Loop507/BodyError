@@ -48,13 +48,16 @@ STYLE_FLUID = "fluid_melt"
 STYLE_LABELS = {
     STYLE_MELT: "Plastination Melt",
     STYLE_VORONOI: "Voronoi Fracture",
-    STYLE_REACTION: "Reaction-Diffusion Bloom (in sviluppo)",
-    STYLE_DEPTH: "Depth Peel (in sviluppo)",
-    STYLE_CAPILLARY: "Capillary Bleed (in sviluppo)",
-    STYLE_FLUID: "Fluid Melt (in sviluppo)",
+    STYLE_REACTION: "Reaction-Diffusion Bloom",
+    STYLE_DEPTH: "Depth Peel",
+    STYLE_CAPILLARY: "Capillary Bleed",
+    STYLE_FLUID: "Fluid Melt",
 }
 
-IMPLEMENTED_STYLES = {STYLE_MELT, STYLE_VORONOI}
+IMPLEMENTED_STYLES = {
+    STYLE_MELT, STYLE_VORONOI, STYLE_REACTION, STYLE_DEPTH,
+    STYLE_CAPILLARY, STYLE_FLUID,
+}
 
 ASPECT_PRESETS = {
     "16:9  (1280x720)": (1280, 720),
@@ -406,23 +409,276 @@ def render_voronoi(base_img, envelope, beat_frames, seed, max_intensity, n_point
 
 
 # ---------------------------------------------------------------------------
-# STUB STILI FUTURI (architettura pronta, algoritmo da implementare)
+# STILE: REACTION-DIFFUSION BLOOM (Gray-Scott model)
 # ---------------------------------------------------------------------------
 
-def render_not_implemented(style_key, *_args, **_kwargs):
-    raise NotImplementedError(
-        f"Stile '{STYLE_LABELS[style_key]}' non ancora implementato. "
-        f"Style '{STYLE_LABELS[style_key]}' not yet implemented."
-    )
+def rd_step(u, v, du=0.16, dv=0.08, feed=0.035, kill=0.065, iterations=1):
+    for _ in range(iterations):
+        lu = cv2.Laplacian(u, cv2.CV_32F)
+        lv = cv2.Laplacian(v, cv2.CV_32F)
+        uvv = u * v * v
+        u = u + (du * lu - uvv + feed * (1 - u))
+        v = v + (dv * lv + uvv - (kill + feed) * v)
+        u = np.clip(u, 0, 1)
+        v = np.clip(v, 0, 1)
+    return u, v
+
+
+def render_reaction_diffusion(base_img, subject_mask, envelope, beat_frames, seed,
+                               max_intensity):
+    rng = np.random.default_rng(seed)
+    h, w = base_img.shape[:2]
+
+    sim_scale = 0.25
+    sh, sw = max(int(h * sim_scale), 24), max(int(w * sim_scale), 24)
+    mask_small = cv2.resize(subject_mask, (sw, sh))
+
+    gray_small = cv2.resize(
+        cv2.cvtColor((base_img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY), (sw, sh))
+    edges_small = cv2.Canny(gray_small, 50, 130).astype(np.float32) / 255.0
+    seed_prob = edges_small * mask_small
+
+    u = np.ones((sh, sw), dtype=np.float32)
+    v = np.zeros((sh, sw), dtype=np.float32)
+
+    ys, xs = np.where(seed_prob > 0.3)
+    if len(xs) == 0:
+        ys, xs = np.array([sh // 2]), np.array([sw // 2])
+    n_seeds = min(18, len(xs))
+    idx = rng.choice(len(xs), n_seeds, replace=False)
+    for i in idx:
+        y, x = int(ys[i]), int(xs[i])
+        v[max(0, y - 2):y + 3, max(0, x - 2):x + 3] = 1.0
+        u[max(0, y - 2):y + 3, max(0, x - 2):x + 3] = 0.5
+
+    xx_base, yy_base = np.meshgrid(np.arange(w).astype(np.float32),
+                                    np.arange(h).astype(np.float32))
+    bloom_color = np.array([0.05, 0.12, 0.05], dtype=np.float32)  # BGR verde scuro/muschio
+
+    frames = []
+    total_frames = len(envelope)
+    for f in range(total_frames):
+        e = float(envelope[f])
+        iters = 1 + int(e * 4)
+        u, v = rd_step(u, v, iterations=iters)
+
+        if f in beat_frames:
+            iy, ix = int(rng.integers(0, sh)), int(rng.integers(0, sw))
+            v[max(0, iy - 2):iy + 3, max(0, ix - 2):ix + 3] = 1.0
+
+        v_big = cv2.resize(v, (w, h), interpolation=cv2.INTER_CUBIC)
+        v_big = np.clip(v_big, 0, 1) * subject_mask
+
+        alpha = v_big[..., None] * (0.55 + 0.3 * max_intensity * e)
+        frame = base_img * (1 - alpha) + bloom_color * alpha
+
+        gx = cv2.Sobel(v_big, cv2.CV_32F, 1, 0, ksize=5)
+        gy = cv2.Sobel(v_big, cv2.CV_32F, 0, 1, ksize=5)
+        disp = float(10.0 * e)
+        new_x = np.clip(xx_base + gx * disp, 0, w - 1)
+        new_y = np.clip(yy_base + gy * disp, 0, h - 1)
+        frame = cv2.remap(frame, new_x, new_y, interpolation=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_REFLECT)
+
+        frame = clinical_grade(frame)
+        frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# STILE: DEPTH PEEL (pseudo-profondita' da shading + sfogliatura a strati)
+# ---------------------------------------------------------------------------
+
+def pseudo_depth_map(img):
+    gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    depth = cv2.GaussianBlur(gray, (25, 25), 0)
+    depth = 1.0 - depth  # zone in ombra trattate come piu' profonde
+    depth = cv2.normalize(depth, None, 0, 1, cv2.NORM_MINMAX)
+    return depth
+
+
+def depth_peel_frame(img, subject_mask, depth, n_bands, band_offset, intensity):
+    h, w = img.shape[:2]
+    result = img.copy()
+
+    for b in range(1, n_bands + 1):
+        lo = (b - 1) / n_bands
+        hi = b / n_bands
+        band_mask = ((depth >= lo) & (depth < hi)).astype(np.float32) * subject_mask
+
+        offset = float(b * band_offset * intensity)
+        m = np.float32([[1, 0, 0], [0, 1, offset]])
+        shifted_img = cv2.warpAffine(img, m, (w, h), borderMode=cv2.BORDER_REFLECT)
+        shifted_mask = cv2.warpAffine(band_mask, m, (w, h))
+
+        tint = np.array([0.15 - b * 0.01, 0.05, 0.25 + b * 0.03], dtype=np.float32)
+        tinted = shifted_img * 0.7 + tint * 0.3
+
+        alpha = shifted_mask[..., None] * 0.5
+        result = result * (1 - alpha) + tinted * alpha
+
+    return result
+
+
+def render_depth_peel(base_img, subject_mask, envelope, beat_frames, seed, max_intensity):
+    depth = pseudo_depth_map(base_img)
+    rng = np.random.default_rng(seed)
+    frames = []
+    total_frames = len(envelope)
+
+    for f in range(total_frames):
+        e = float(envelope[f])
+        n_bands = 2 + int(e * 4)
+        band_offset = 4.0
+        if f in beat_frames:
+            band_offset *= 1.3
+        intensity = 0.3 + max_intensity * e
+
+        frame = depth_peel_frame(base_img, subject_mask, depth, n_bands, band_offset, intensity)
+        frame = clinical_grade(frame)
+        frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+
+    _ = rng  # riservato per jitter futuro sui bordi di banda
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# STILE: CAPILLARY BLEED (random-walk vincolato ai bordi ad alto contrasto)
+# ---------------------------------------------------------------------------
+
+def render_capillary_bleed(base_img, subject_mask, envelope, beat_frames, seed,
+                            max_intensity, n_walkers=40):
+    rng = np.random.default_rng(seed)
+    h, w = base_img.shape[:2]
+
+    gray = cv2.cvtColor((base_img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    gx = cv2.Sobel(gray_blur, cv2.CV_32F, 1, 0, ksize=5)
+    gy = cv2.Sobel(gray_blur, cv2.CV_32F, 0, 1, ksize=5)
+    mag = np.sqrt(gx ** 2 + gy ** 2) + 1e-6
+    gx_n = gx / mag
+    gy_n = gy / mag
+
+    edges = cv2.Canny(gray_blur, 50, 130)
+    ys, xs = np.where(edges > 0)
+    if len(xs) == 0:
+        ys, xs = np.array([h // 2]), np.array([w // 2])
+    idx = rng.choice(len(xs), min(n_walkers, len(xs)), replace=False)
+    walker_pos = np.stack([xs[idx], ys[idx]], axis=1).astype(np.float32)
+    walker_dir = rng.uniform(-1, 1, walker_pos.shape).astype(np.float32)
+
+    vein_mask = np.zeros((h, w), dtype=np.float32)
+    bleed_color = np.array([0.05, 0.02, 0.35], dtype=np.float32)  # BGR rosso scuro
+
+    frames = []
+    total_frames = len(envelope)
+    max_walkers = n_walkers * 4
+
+    for f in range(total_frames):
+        e = float(envelope[f])
+        step_size = 1.0 + 3.0 * e
+
+        xi = np.clip(walker_pos[:, 0].astype(int), 0, w - 1)
+        yi = np.clip(walker_pos[:, 1].astype(int), 0, h - 1)
+        tangent_x = -gy_n[yi, xi]
+        tangent_y = gx_n[yi, xi]
+        rand_perturb = rng.uniform(-0.4, 0.4, walker_dir.shape).astype(np.float32)
+        walker_dir = (0.7 * walker_dir + 0.3 * np.stack([tangent_x, tangent_y], axis=1)
+                      + rand_perturb)
+        norm = np.linalg.norm(walker_dir, axis=1, keepdims=True) + 1e-6
+        walker_dir = walker_dir / norm
+
+        walker_pos = walker_pos + walker_dir * step_size
+        walker_pos[:, 0] = np.clip(walker_pos[:, 0], 0, w - 1)
+        walker_pos[:, 1] = np.clip(walker_pos[:, 1], 0, h - 1)
+
+        xi2 = walker_pos[:, 0].astype(int)
+        yi2 = walker_pos[:, 1].astype(int)
+        vein_mask[yi2, xi2] = 1.0
+
+        if f in beat_frames and len(walker_pos) < max_walkers:
+            n_new = min(4, n_walkers)
+            branch_idx = rng.integers(0, len(walker_pos), n_new)
+            new_pos = walker_pos[branch_idx] + rng.uniform(-2, 2, (n_new, 2))
+            new_pos[:, 0] = np.clip(new_pos[:, 0], 0, w - 1)
+            new_pos[:, 1] = np.clip(new_pos[:, 1], 0, h - 1)
+            new_dir = rng.uniform(-1, 1, (n_new, 2)).astype(np.float32)
+            walker_pos = np.concatenate([walker_pos, new_pos.astype(np.float32)], axis=0)
+            walker_dir = np.concatenate([walker_dir, new_dir], axis=0)
+
+        vein_blur = cv2.GaussianBlur(vein_mask, (3, 3), 0)
+        vein_blur = np.clip(vein_blur * subject_mask, 0, 1)
+
+        alpha = vein_blur[..., None] * (0.6 + 0.3 * e)
+        frame = base_img * (1 - alpha) + bleed_color * alpha
+        frame = clinical_grade(frame)
+        frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# STILE: FLUID MELT (mini solver semi-Lagrangiano, stile Stam)
+# ---------------------------------------------------------------------------
+
+def semi_lagrangian_advect(field, vel_x, vel_y, dt=1.0):
+    h, w = field.shape[:2]
+    xx, yy = np.meshgrid(np.arange(w).astype(np.float32), np.arange(h).astype(np.float32))
+    back_x = np.clip(xx - vel_x * dt, 0, w - 1)
+    back_y = np.clip(yy - vel_y * dt, 0, h - 1)
+    return cv2.remap(field, back_x, back_y, interpolation=cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_REFLECT)
+
+
+def render_fluid_melt(base_img, subject_mask, envelope, beat_frames, seed, max_intensity):
+    rng = np.random.default_rng(seed)
+    h, w = base_img.shape[:2]
+
+    noise_small = rng.uniform(-1, 1, (max(h // 20, 4), max(w // 20, 4))).astype(np.float32)
+    noise = cv2.resize(noise_small, (w, h), interpolation=cv2.INTER_CUBIC)
+    noise = cv2.GaussianBlur(noise, (0, 0), sigmaX=15)
+
+    # campo di velocita' turbolento fisso (no auto-advection: evita il feedback
+    # che amplificava la deformazione fino a distruggere l'immagine)
+    vel_x_base = noise * 0.5 * subject_mask
+    vel_y_base = noise * 0.3 * subject_mask
+
+    accumulated = base_img.copy()
+    frames = []
+    total_frames = len(envelope)
+
+    for f in range(total_frames):
+        e = float(envelope[f])
+        gravity = float(0.4 + 0.6 * e)
+
+        vx_frame = np.clip(vel_x_base, -1.5, 1.5)
+        vy_frame = np.clip(vel_y_base + gravity * subject_mask, -1.8, 1.8)
+
+        if f in beat_frames:
+            vy_frame = vy_frame * 1.3
+
+        vx_frame = cv2.GaussianBlur(vx_frame, (5, 5), 0)
+        vy_frame = cv2.GaussianBlur(vy_frame, (5, 5), 0)
+
+        # spostamento per-frame come budget totale ripartito sulla durata,
+        # stesso principio di scaling usato in Plastination Melt
+        per_frame_dt = float((max_intensity / total_frames) * (0.5 + 2.5 * e))
+        accumulated = semi_lagrangian_advect(accumulated, vx_frame, vy_frame, dt=per_frame_dt)
+
+        frame = clinical_grade(accumulated)
+        frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+
+    return frames
 
 
 STYLE_RENDERERS = {
     STYLE_MELT: "melt",
     STYLE_VORONOI: "voronoi",
-    STYLE_REACTION: "stub",
-    STYLE_DEPTH: "stub",
-    STYLE_CAPILLARY: "stub",
-    STYLE_FLUID: "stub",
+    STYLE_REACTION: "reaction_diffusion",
+    STYLE_DEPTH: "depth_peel",
+    STYLE_CAPILLARY: "capillary_bleed",
+    STYLE_FLUID: "fluid_melt",
 }
 
 
@@ -675,8 +931,28 @@ def main():
                     base_img, envelope, beat_frames, int(seed),
                     max_intensity=float(max_strength) / 40.0, n_points=28,
                 )
+            elif STYLE_RENDERERS[style_key] == "reaction_diffusion":
+                frames = render_reaction_diffusion(
+                    base_img, subject_mask, envelope, beat_frames, int(seed),
+                    max_intensity=float(max_strength) / 60.0,
+                )
+            elif STYLE_RENDERERS[style_key] == "depth_peel":
+                frames = render_depth_peel(
+                    base_img, subject_mask, envelope, beat_frames, int(seed),
+                    max_intensity=float(max_strength) / 40.0,
+                )
+            elif STYLE_RENDERERS[style_key] == "capillary_bleed":
+                frames = render_capillary_bleed(
+                    base_img, subject_mask, envelope, beat_frames, int(seed),
+                    max_intensity=float(max_strength) / 60.0, n_walkers=40,
+                )
+            elif STYLE_RENDERERS[style_key] == "fluid_melt":
+                frames = render_fluid_melt(
+                    base_img, subject_mask, envelope, beat_frames, int(seed),
+                    max_intensity=float(max_strength) * 0.9,
+                )
             else:
-                render_not_implemented(style_key)
+                st.error("Stile non riconosciuto. / Unrecognized style.")
                 return
 
             elapsed = time.time() - t0
