@@ -171,17 +171,6 @@ def detect_landmarks(img_float_bgr):
     return pts
 
 
-def face_region_mask(pts, shape, dilate_px=25):
-    """Maschera binaria (sfumata) della regione del volto, dal convex hull dei landmark."""
-    h, w = shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    hull = cv2.convexHull(pts.astype(np.int32))
-    cv2.fillConvexPoly(mask, hull, 255)
-    kernel = np.ones((dilate_px, dilate_px), np.uint8)
-    mask = cv2.dilate(mask, kernel)
-    mask = cv2.GaussianBlur(mask, (25, 25), 0)
-    return mask.astype(np.float32) / 255.0
-
 
 # ---------------------------------------------------------------------------
 # ANALISI AUDIO A 3 BANDE (bassi / medi / alti)
@@ -861,19 +850,25 @@ def main():
             pts = detect_landmarks(base_img)
             if pts is None:
                 st.warning(
-                    "Nessun volto rilevato: uso una maschera generica invece dei "
-                    "landmark (risultato meno preciso). / No face detected: using "
-                    "a generic mask instead of landmarks (less precise result)."
+                    "Nessun volto rilevato: gli stili basati sui landmark saranno "
+                    "limitati. / No face detected: landmark-based styles will be "
+                    "limited."
                 )
-                region_mask = build_background_subject_mask(base_img)
-            else:
-                region_mask = face_region_mask(pts, base_img.shape)
+
+            # Voronoi e Capillary Bleed devono coprire l'intero soggetto (utile
+            # anche per foto a figura intera), non solo il piccolo poligono del
+            # volto - quindi usano sempre la sagoma sfondo/primo piano.
+            region_mask = build_background_subject_mask(base_img)
 
             if style_key == STYLE_ANATOMICAL and pts is None:
                 st.error(
-                    "Anatomical Warp richiede un volto rilevabile nella foto. "
-                    "Prova un altro stile o un'altra foto. / Anatomical Warp "
-                    "requires a detectable face. Try another style or photo."
+                    "Anatomical Warp richiede un volto rilevabile nella foto: "
+                    "deforma solo i tratti del viso (occhi/naso/bocca/mascella), "
+                    "non il corpo intero. Per una figura intera prova Voronoi "
+                    "Fracture o Capillary Bleed. / Anatomical Warp requires a "
+                    "detectable face: it only deforms facial features, not the "
+                    "whole body. For a full-body photo try Voronoi Fracture or "
+                    "Capillary Bleed instead."
                 )
                 return
 
