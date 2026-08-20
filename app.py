@@ -22,6 +22,7 @@ import time
 
 import cv2
 import numpy as np
+import soundfile as sf
 import streamlit as st
 
 try:
@@ -55,21 +56,45 @@ STYLE_LABELS = {
 
 IMPLEMENTED_STYLES = {STYLE_MELT, STYLE_VORONOI}
 
+ASPECT_PRESETS = {
+    "16:9  (1280x720)": (1280, 720),
+    "9:16  (720x1280)": (720, 1280),
+    "1:1   (720x720)": (720, 720),
+}
+
+MAX_DURATION_SEC = 300  # 5 minuti, con avviso sul tempo di rendering
+
 
 # ---------------------------------------------------------------------------
 # UTILITY IMMAGINE
 # ---------------------------------------------------------------------------
 
-def load_image_bgr_float(path, max_dim=None):
+def load_image_fit_aspect(path, target_w, target_h):
+    """
+    Carica l'immagine e la adatta alla risoluzione target tramite center-crop
+    (mantiene l'aspect ratio richiesto senza deformare il soggetto) + resize.
+    """
     img = cv2.imread(path)
     if img is None:
         raise ValueError("Immagine non leggibile / Image could not be read")
-    if max_dim is not None:
-        h, w = img.shape[:2]
-        scale = max_dim / max(h, w)
-        if scale < 1.0:
-            img = cv2.resize(img, (int(w * scale), int(h * scale)),
-                              interpolation=cv2.INTER_AREA)
+
+    h, w = img.shape[:2]
+    target_ratio = target_w / target_h
+    src_ratio = w / h
+
+    if src_ratio > target_ratio:
+        # sorgente piu' larga: crop orizzontale
+        new_w = int(h * target_ratio)
+        x0 = (w - new_w) // 2
+        img = img[:, x0:x0 + new_w]
+    else:
+        # sorgente piu' alta: crop verticale
+        new_h = int(w / target_ratio)
+        y0 = (h - new_h) // 2
+        img = img[y0:y0 + new_h, :]
+
+    interp = cv2.INTER_AREA if img.shape[0] > target_h else cv2.INTER_LANCZOS4
+    img = cv2.resize(img, (target_w, target_h), interpolation=interp)
     return img.astype(np.float32) / 255.0
 
 
@@ -104,6 +129,11 @@ def clinical_grade(img):
 # ---------------------------------------------------------------------------
 # ANALISI AUDIO -> ENVELOPE DI INTENSITA'
 # ---------------------------------------------------------------------------
+
+def get_audio_duration(path):
+    info = sf.info(path)
+    return float(info.frames) / float(info.samplerate)
+
 
 def analyze_audio(path, target_fps, duration_sec):
     """
@@ -400,7 +430,8 @@ STYLE_RENDERERS = {
 # EXPORT VIDEO + MUX AUDIO
 # ---------------------------------------------------------------------------
 
-def write_video(frames, fps, out_path):
+def write_raw_video(frames, fps, out_path):
+    """Scrittura intermedia veloce (mp4v) - non browser-playable, solo staging."""
     h, w = frames[0].shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
@@ -409,17 +440,31 @@ def write_video(frames, fps, out_path):
     writer.release()
 
 
-def mux_audio(video_path, audio_path, out_path, duration_sec):
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-t", str(duration_sec),
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        out_path,
-    ]
+def finalize_video(raw_video_path, audio_path, duration_sec, out_path):
+    """
+    Transcodifica in H.264 / yuv420p (compatibilita' browser per l'anteprima
+    st.video e per il download) ed esegue il mux dell'audio se presente,
+    nello stesso passaggio ffmpeg.
+    """
+    if audio_path is not None:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", raw_video_path,
+            "-i", audio_path,
+            "-t", str(duration_sec),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
+            "-c:a", "aac", "-shortest",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", raw_video_path,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
+            "-movflags", "+faststart",
+            out_path,
+        ]
     subprocess.run(cmd, check=True, capture_output=True)
 
 
@@ -488,16 +533,73 @@ def main():
         index=0,
     )
 
+    st.subheader("Formato / Format")
+    col_res1, col_res2 = st.columns(2)
+    with col_res1:
+        aspect_label = st.selectbox("Aspect ratio", options=list(ASPECT_PRESETS.keys()), index=0)
+    with col_res2:
+        quick_preview = st.checkbox(
+            "Anteprima rapida (mezza risoluzione) / Quick preview (half-res)",
+            value=True,
+            help="Dimezza la risoluzione per un render piu' veloce in fase di test. "
+                 "Halves resolution for faster test renders.",
+        )
+
+    target_w, target_h = ASPECT_PRESETS[aspect_label]
+    if quick_preview:
+        target_w, target_h = target_w // 2, target_h // 2
+    st.caption(f"Risoluzione di render / Render resolution: {target_w}x{target_h}")
+
+    st.subheader("Durata / Duration")
+    audio_duration = None
+    use_audio_duration = False
+    if audio_file is not None:
+        # leggiamo la durata senza decodificare tutto il file
+        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp_probe:
+            tmp_probe.write(audio_file.getvalue())
+            probe_path = tmp_probe.name
+        try:
+            audio_duration = get_audio_duration(probe_path)
+        except Exception:
+            audio_duration = None
+        finally:
+            os.unlink(probe_path)
+
+        if audio_duration is not None:
+            use_audio_duration = st.checkbox(
+                f"Usa la durata del brano ({audio_duration:.1f}s) / Use track duration",
+                value=True,
+            )
+
+    if use_audio_duration and audio_duration is not None:
+        duration_sec = min(audio_duration, MAX_DURATION_SEC)
+        if audio_duration > MAX_DURATION_SEC:
+            st.warning(
+                f"Brano piu' lungo di {MAX_DURATION_SEC}s: video troncato a "
+                f"{MAX_DURATION_SEC}s. / Track longer than {MAX_DURATION_SEC}s: "
+                f"video capped at {MAX_DURATION_SEC}s."
+            )
+    else:
+        duration_sec = st.slider(
+            "Durata (s) / Duration (s)", 3, MAX_DURATION_SEC, 15,
+            help="Video lunghi = tempo di rendering molto maggiore. "
+                 "Long videos = much longer render time.",
+        )
+
+    if duration_sec > 60:
+        st.info(
+            "Durate superiori al minuto possono richiedere diversi minuti di "
+            "rendering, specialmente a piena risoluzione. / Durations over a "
+            "minute may take several minutes to render, especially at full resolution."
+        )
+
     col1, col2 = st.columns(2)
     with col1:
-        duration_sec = st.slider("Durata (s) / Duration (s)", 3, 30, 6)
         seed = st.number_input("Seed", min_value=0, value=7, step=1)
     with col2:
-        quick_preview = st.checkbox("Anteprima rapida 480p / Quick 480p preview", value=True)
         max_strength = st.slider("Intensita' massima / Max intensity", 10, 100, 55)
 
     fps = 24
-    max_dim = 480 if quick_preview else 960
 
     render_clicked = st.button("Genera / Render", type="primary")
 
@@ -516,13 +618,13 @@ def main():
         with tempfile.TemporaryDirectory() as tmpdir:
             img_path = os.path.join(tmpdir, "input.jpg")
             with open(img_path, "wb") as fh:
-                fh.write(image_file.read())
+                fh.write(image_file.getvalue())
 
             audio_path = None
             if audio_file is not None:
                 audio_path = os.path.join(tmpdir, "input_audio.mp3")
                 with open(audio_path, "wb") as fh:
-                    fh.write(audio_file.read())
+                    fh.write(audio_file.getvalue())
 
             progress = st.progress(0, text="Analisi audio / Audio analysis...")
 
@@ -535,11 +637,11 @@ def main():
                                "librosa unavailable: using synthetic envelope.")
                 envelope, beat_frames, bpm_value = synthetic_envelope(fps, duration_sec)
 
-            progress.progress(20, text="Caricamento immagine / Loading image...")
-            base_img = load_image_bgr_float(img_path, max_dim=max_dim)
+            progress.progress(15, text="Caricamento immagine / Loading image...")
+            base_img = load_image_fit_aspect(img_path, target_w, target_h)
             subject_mask = build_subject_mask(base_img)
 
-            progress.progress(35, text="Rendering frame / Rendering frames...")
+            progress.progress(30, text="Rendering frame / Rendering frames...")
             t0 = time.time()
 
             if STYLE_RENDERERS[style_key] == "melt":
@@ -557,22 +659,19 @@ def main():
                 return
 
             elapsed = time.time() - t0
-            progress.progress(75, text=f"Frame renderizzati in {elapsed:.1f}s / Encoding video...")
+            progress.progress(70, text=f"Frame renderizzati in {elapsed:.1f}s / Encoding...")
 
             raw_video_path = os.path.join(tmpdir, "raw.mp4")
-            write_video(frames, fps, raw_video_path)
+            write_raw_video(frames, fps, raw_video_path)
 
+            progress.progress(85, text="Transcodifica H.264 + mux audio / "
+                                        "H.264 transcode + audio mux...")
             final_path = os.path.join(tmpdir, "bodyerror_output.mp4")
-            if audio_path is not None:
-                progress.progress(90, text="Mux audio...")
-                try:
-                    mux_audio(raw_video_path, audio_path, final_path, duration_sec)
-                except subprocess.CalledProcessError:
-                    st.warning("Mux audio fallito, esporto solo video. / "
-                               "Audio mux failed, exporting video only.")
-                    final_path = raw_video_path
-            else:
-                final_path = raw_video_path
+            try:
+                finalize_video(raw_video_path, audio_path, duration_sec, final_path)
+            except subprocess.CalledProcessError as exc:
+                st.error(f"Errore ffmpeg / ffmpeg error: {exc.stderr.decode(errors='ignore')[-500:]}")
+                return
 
             output_bytes_path = os.path.join(tempfile.gettempdir(),
                                               f"bodyerror_{int(time.time())}.mp4")
@@ -582,7 +681,7 @@ def main():
             st.session_state.output_path = output_bytes_path
             st.session_state.report_text = build_report(
                 style_key, int(seed), duration_sec, fps,
-                f"{'480p' if quick_preview else '960p'} max-dim",
+                f"{target_w}x{target_h} ({aspect_label})",
                 audio_path is not None, bpm_value,
             )
 
