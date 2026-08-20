@@ -519,10 +519,12 @@ def main():
         st.session_state.output_path = None
         st.session_state.report_text = None
 
-    image_file = st.file_uploader("Foto / Photo (jpg, png)", type=["jpg", "jpeg", "png"])
+    image_file = st.file_uploader(
+        "Foto / Photo (jpg, png)", type=["jpg", "jpeg", "png"], key="uploader_image",
+    )
     audio_file = st.file_uploader(
         "Audio opzionale / Optional audio (mp3, wav) — guida il ritmo della deformazione",
-        type=["mp3", "wav"],
+        type=["mp3", "wav"], key="uploader_audio",
     )
 
     style_options = list(STYLE_LABELS.keys())
@@ -531,16 +533,21 @@ def main():
         options=style_options,
         format_func=lambda k: STYLE_LABELS[k],
         index=0,
+        key="select_style",
     )
 
     st.subheader("Formato / Format")
     col_res1, col_res2 = st.columns(2)
     with col_res1:
-        aspect_label = st.selectbox("Aspect ratio", options=list(ASPECT_PRESETS.keys()), index=0)
+        aspect_label = st.selectbox(
+            "Aspect ratio", options=list(ASPECT_PRESETS.keys()), index=0,
+            key="select_aspect",
+        )
     with col_res2:
         quick_preview = st.checkbox(
             "Render veloce, mezza risoluzione / Fast render, half-res",
             value=False,
+            key="check_quick_preview",
             help="Dimezza la risoluzione del FILE FINALE (non solo dell'anteprima) "
                  "per velocizzare i test. Lascia disattivato per scaricare alla "
                  "risoluzione selezionata sopra. / Halves the FINAL FILE resolution "
@@ -554,10 +561,12 @@ def main():
     st.caption(f"Risoluzione di render / Render resolution: {target_w}x{target_h}")
 
     st.subheader("Durata / Duration")
+
+    # Struttura DOM stabile: il checkbox esiste sempre (disabilitato senza audio),
+    # cosi' l'albero dei widget non cambia tra i rerun e si evita il conflitto
+    # di riconciliazione React ("removeChild") osservato su Streamlit Cloud.
     audio_duration = None
-    use_audio_duration = False
     if audio_file is not None:
-        # leggiamo la durata senza decodificare tutto il file
         with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp_probe:
             tmp_probe.write(audio_file.getvalue())
             probe_path = tmp_probe.name
@@ -568,11 +577,17 @@ def main():
         finally:
             os.unlink(probe_path)
 
-        if audio_duration is not None:
-            use_audio_duration = st.checkbox(
-                f"Usa la durata del brano ({audio_duration:.1f}s) / Use track duration",
-                value=True,
-            )
+    duration_checkbox_label = (
+        f"Usa la durata del brano ({audio_duration:.1f}s) / Use track duration"
+        if audio_duration is not None
+        else "Usa la durata del brano / Use track duration (carica un audio)"
+    )
+    use_audio_duration = st.checkbox(
+        duration_checkbox_label,
+        value=True,
+        disabled=(audio_duration is None),
+        key="check_use_audio_duration",
+    )
 
     if use_audio_duration and audio_duration is not None:
         duration_sec = min(audio_duration, MAX_DURATION_SEC)
@@ -585,6 +600,7 @@ def main():
     else:
         duration_sec = st.slider(
             "Durata (s) / Duration (s)", 3, MAX_DURATION_SEC, 15,
+            key="slider_duration",
             help="Video lunghi = tempo di rendering molto maggiore. "
                  "Long videos = much longer render time.",
         )
@@ -598,13 +614,15 @@ def main():
 
     col1, col2 = st.columns(2)
     with col1:
-        seed = st.number_input("Seed", min_value=0, value=7, step=1)
+        seed = st.number_input("Seed", min_value=0, value=7, step=1, key="input_seed")
     with col2:
-        max_strength = st.slider("Intensita' massima / Max intensity", 10, 100, 55)
+        max_strength = st.slider(
+            "Intensita' massima / Max intensity", 10, 100, 55, key="slider_strength",
+        )
 
     fps = 24
 
-    render_clicked = st.button("Genera / Render", type="primary")
+    render_clicked = st.button("Genera / Render", type="primary", key="button_render")
 
     if render_clicked:
         if image_file is None:
@@ -698,8 +716,9 @@ def main():
                 data=fh.read(),
                 file_name="bodyerror_output.mp4",
                 mime="video/mp4",
+                key="button_download",
             )
-        st.text_area("Report", st.session_state.report_text, height=220)
+        st.text_area("Report", st.session_state.report_text, height=220, key="area_report")
 
 
 if __name__ == "__main__":
