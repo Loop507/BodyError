@@ -539,10 +539,13 @@ def main():
         aspect_label = st.selectbox("Aspect ratio", options=list(ASPECT_PRESETS.keys()), index=0)
     with col_res2:
         quick_preview = st.checkbox(
-            "Anteprima rapida (mezza risoluzione) / Quick preview (half-res)",
-            value=True,
-            help="Dimezza la risoluzione per un render piu' veloce in fase di test. "
-                 "Halves resolution for faster test renders.",
+            "Render veloce, mezza risoluzione / Fast render, half-res",
+            value=False,
+            help="Dimezza la risoluzione del FILE FINALE (non solo dell'anteprima) "
+                 "per velocizzare i test. Lascia disattivato per scaricare alla "
+                 "risoluzione selezionata sopra. / Halves the FINAL FILE resolution "
+                 "(not just the preview) to speed up testing. Leave unchecked to "
+                 "download at the resolution selected above.",
         )
 
     target_w, target_h = ASPECT_PRESETS[aspect_label]
