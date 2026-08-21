@@ -356,7 +356,11 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         avg_e = (eb + em + eh_) / 3.0
         growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
 
-        permanent = growth_acc * base_intensity * 0.6
+        # respiro: oscillazione lenta cosi' la componente permanente non resta
+        # piatta una volta saturata (evita l'effetto "monotono" a lungo termine)
+        breathing = float(0.8 + 0.2 * np.sin(f / max(total_frames, 1) * np.pi * 8))
+
+        permanent = growth_acc * base_intensity * 0.6 * breathing
         jaw_i = permanent + eb * w_bass * base_intensity
         mouth_i = permanent * 0.6 + em * w_mid * base_intensity
         eye_i = permanent * 0.4 + eh_ * w_high * base_intensity
@@ -408,13 +412,21 @@ def build_cell_labels(shape, points):
     return labels.reshape(h, w)
 
 
-def voronoi_fracture_frame(img, region_mask, intensity, n_points, rng):
+def compute_voronoi_cells(img, region_mask, n_points, rng):
+    """Parte costosa (Canny + query cKDTree su ogni pixel): va ricalcolata
+    solo quando cambiano i punti seme (cioe' ai beat), non ad ogni frame."""
     h, w = img.shape[:2]
     gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
     gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
     points = seed_points_in_region(gray_blur, region_mask, n_points, rng)
     labels = build_cell_labels((h, w), points)
+    return points, labels
+
+
+def apply_voronoi_displacement(img, points, labels, intensity, rng):
+    """Parte economica (solo spostamento delle celle gia' segmentate): questa
+    si ricalcola ad ogni frame perche' l'intensita' cambia con l'audio."""
+    h, w = img.shape[:2]
     n_cells = len(points)
     cx = points[:, 0].mean()
     cy = points[:, 1].mean()
@@ -435,7 +447,6 @@ def voronoi_fracture_frame(img, region_mask, intensity, n_points, rng):
     # NON annerita - cosi' dove una placca si sposta si vede ancora il volto
     # sottostante (materia reale), mai un vuoto/crepa nera
     underlayer = cv2.GaussianBlur(img, (9, 9), 0) * 0.92
-
     result = underlayer.copy()
 
     for i in range(n_cells):
@@ -477,11 +488,15 @@ def voronoi_fracture_frame(img, region_mask, intensity, n_points, rng):
 
 def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
                     seed, base_intensity, n_points, growth_rate, writer):
-    """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM)."""
-    rng_seed_stream = np.random.default_rng(seed)
+    """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM).
+    I punti/celle Voronoi si ricalcolano solo ai beat (costoso), non ogni
+    frame (economico): stesso identico risultato visivo, molto meno CPU."""
     total_frames = len(env_bass)
     growth_acc = 0.0
     seed_offset = 0
+
+    cache_rng = np.random.default_rng(seed)
+    points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -490,14 +505,18 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
 
         if f in beat_frames:
             seed_offset += 1
-        local_rng = np.random.default_rng(seed + seed_offset)
+            cache_rng = np.random.default_rng(seed + seed_offset)
+            points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
-        intensity = 0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)
-        frame = voronoi_fracture_frame(base_img, region_mask, intensity, n_points, local_rng)
+        # respiro: oscillazione lenta sovrapposta alla crescita, cosi' anche
+        # a energia audio costante l'intensita' non resta piatta
+        breathing = float(0.85 + 0.15 * np.sin(f / max(total_frames, 1) * np.pi * 6))
+        intensity = (0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)) * breathing
+
+        disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
+        frame = apply_voronoi_displacement(base_img, points, labels, intensity, disp_rng)
         frame = clinical_grade(frame)
         writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
-
-    _ = rng_seed_stream
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +599,10 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
         vein_blur = cv2.GaussianBlur(vein_mask, (3, 3), 0)
         vein_blur = np.clip(vein_blur * region_mask, 0, 1)
 
-        # i BASSI pilotano lo spessore/opacita' delle venature
-        alpha = vein_blur[..., None] * (0.4 + 0.5 * eb) * base_intensity
+        # i BASSI pilotano lo spessore/opacita', con un lieve respiro cosi'
+        # anche a energia costante l'opacita' non resta piatta
+        breathing = float(0.85 + 0.15 * np.sin(f / max(total_frames, 1) * np.pi * 10))
+        alpha = vein_blur[..., None] * (0.4 + 0.5 * eb) * base_intensity * breathing
         frame = base_img * (1 - alpha) + bleed_color * alpha
         frame = clinical_grade(frame)
         writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
@@ -805,6 +826,12 @@ def main():
             st.error("dlib non disponibile: impossibile procedere. / "
                       "dlib not available: cannot proceed.")
             return
+
+        # Pulisce il risultato precedente PRIMA di iniziare: se questo render
+        # fallisce o va in timeout, l'utente non deve vedere/scaricare per
+        # sbaglio il video di un tentativo precedente con altre impostazioni.
+        st.session_state.output_path = None
+        st.session_state.report_text = None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             img_path = os.path.join(tmpdir, "input.jpg")
