@@ -5,4 +5,3 @@ scipy>=1.13.0
 librosa>=0.10.2
 soundfile>=0.12.1
 dlib-bin>=19.24.6
-face_recognition_models>=0.3.0
