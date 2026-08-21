@@ -37,7 +37,6 @@ except ImportError:
 
 try:
     import dlib
-    import face_recognition_models
     DLIB_OK = True
 except ImportError:
     DLIB_OK = False
@@ -66,6 +65,15 @@ ASPECT_PRESETS = {
 }
 
 MAX_DURATION_SEC = 300  # 5 minuti, con avviso sul tempo di rendering
+
+# Modello dlib scaricato a runtime da un mirror GitHub (raw.githubusercontent.com)
+# invece del pacchetto pip "face_recognition_models" (100MB, solo sorgente,
+# spesso in timeout su piattaforme con risorse limitate come Streamlit Cloud).
+DLIB_MODEL_URL = (
+    "https://raw.githubusercontent.com/davisking/dlib-models/master/"
+    "shape_predictor_68_face_landmarks.dat.bz2"
+)
+DLIB_MODEL_PATH = os.path.join(tempfile.gettempdir(), "shape_predictor_68_face_landmarks.dat")
 
 # gruppi anatomici standard dlib 68-punti
 LANDMARK_GROUPS = {
@@ -147,20 +155,43 @@ _DLIB_DETECTOR = None
 _DLIB_PREDICTOR = None
 
 
+def _ensure_dlib_model():
+    """Scarica e decomprime il modello dlib al primo utilizzo, se non gia' presente."""
+    if os.path.exists(DLIB_MODEL_PATH) and os.path.getsize(DLIB_MODEL_PATH) > 90_000_000:
+        return
+    import bz2
+    import urllib.request
+
+    compressed_path = DLIB_MODEL_PATH + ".bz2"
+    urllib.request.urlretrieve(DLIB_MODEL_URL, compressed_path)
+    with open(compressed_path, "rb") as f_in:
+        data = bz2.decompress(f_in.read())
+    with open(DLIB_MODEL_PATH, "wb") as f_out:
+        f_out.write(data)
+    os.unlink(compressed_path)
+
+
+@st.cache_resource
 def _get_dlib_models():
-    global _DLIB_DETECTOR, _DLIB_PREDICTOR
-    if _DLIB_DETECTOR is None:
-        _DLIB_DETECTOR = dlib.get_frontal_face_detector()
-        _DLIB_PREDICTOR = dlib.shape_predictor(
-            face_recognition_models.pose_predictor_model_location())
-    return _DLIB_DETECTOR, _DLIB_PREDICTOR
+    _ensure_dlib_model()
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor(DLIB_MODEL_PATH)
+    return detector, predictor
 
 
 def detect_landmarks(img_float_bgr):
-    """Restituisce (68,2) landmark in coordinate pixel, o None se nessun volto."""
+    """Restituisce (68,2) landmark in coordinate pixel, o None se nessun volto
+    o se il modello dlib non e' disponibile (import fallito o download fallito)."""
     if not DLIB_OK:
         return None
-    detector, predictor = _get_dlib_models()
+    try:
+        detector, predictor = _get_dlib_models()
+    except Exception as exc:
+        st.warning(
+            f"Impossibile caricare il modello dei landmark del volto: {exc} / "
+            f"Could not load the face landmark model: {exc}"
+        )
+        return None
     img_u8 = (np.clip(img_float_bgr, 0, 1) * 255).astype(np.uint8)
     gray = cv2.cvtColor(img_u8, cv2.COLOR_BGR2GRAY)
     faces = detector(gray, 1)
