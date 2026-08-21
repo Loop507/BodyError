@@ -1,21 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-BodyError // Loop507
-=====================
-Trasforma una foto in un video "Body Error Realistico": scomposizione
-anatomica REALE, ancorata ai landmark del volto (dlib, 68 punti), guidata
-da 3 bande audio separate (bassi/medi/alti) con controlli indipendenti.
-Pure DSP / algoritmico - nessuna rete neurale generativa (dlib usa un
-modello di regressione classico per i landmark, non genera contenuto).
-
-Loop507 protocol:
-- py_compile + pyflakes zero warning
-- report bilingue IT/EN
-- session_state per persistenza download
-- seed system per riproducibilita'
-
-Deploy: sostituisci il file su GitHub -> commit -> "Reboot app" dal Manage panel.
-"""
+"""BodyError // Loop507 - foto -> video di scomposizione anatomica, ancorata
+ai landmark del volto (dlib) e guidata da 3 bande audio (bassi/medi/alti)."""
 
 import os
 import subprocess
@@ -92,10 +77,7 @@ LANDMARK_GROUPS = {
 # ---------------------------------------------------------------------------
 
 def load_image_fit_aspect(path, target_w, target_h):
-    """
-    Carica l'immagine e la adatta alla risoluzione target tramite center-crop
-    (mantiene l'aspect ratio richiesto senza deformare il soggetto) + resize.
-    """
+    """Carica l'immagine e la adatta alla risoluzione target (center-crop + resize)."""
     img = cv2.imread(path)
     if img is None:
         raise ValueError("Immagine non leggibile / Image could not be read")
@@ -194,7 +176,13 @@ def detect_landmarks(img_float_bgr):
         return None
     img_u8 = (np.clip(img_float_bgr, 0, 1) * 255).astype(np.uint8)
     gray = cv2.cvtColor(img_u8, cv2.COLOR_BGR2GRAY)
+
+    # primo tentativo veloce (upsample=1); se non trova nulla, riprova con
+    # upsample piu' aggressivo (piu' lento ma piu' robusto su crop stretti
+    # o volti piccoli nel frame, es. aspect ratio molto larghi/stretti)
     faces = detector(gray, 1)
+    if len(faces) == 0:
+        faces = detector(gray, 2)
     if len(faces) == 0:
         return None
     shape = predictor(gray, faces[0])
@@ -222,11 +210,7 @@ def _normalize_envelope(energy, energy_times, video_times):
 
 
 def analyze_audio_bands(path, target_fps, duration_sec):
-    """
-    Estrae 3 envelope di energia indipendenti (bassi/medi/alti) via STFT,
-    piu' i frame dei beat e il BPM stimato, per pilotare separatamente le
-    diverse componenti anatomiche della deformazione.
-    """
+    """Envelope di energia bassi/medi/alti via STFT + frame dei beat + BPM."""
     y, sr = librosa.load(path, sr=22050, mono=True, duration=duration_sec)
     stft = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
     freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
@@ -257,11 +241,7 @@ def analyze_audio_bands(path, target_fps, duration_sec):
 
 
 def synthetic_bands(target_fps, duration_sec):
-    """
-    Fallback se non c'e' audio: tre curve ADSR-style leggermente sfasate,
-    cosi' anche senza musica le tre componenti (bassi/medi/alti) non sono
-    identiche tra loro.
-    """
+    """Fallback senza audio: tre curve ADSR leggermente sfasate tra loro."""
     total_frames = int(duration_sec * target_fps)
     t = np.linspace(0, 1, total_frames)
 
@@ -295,12 +275,7 @@ def synthetic_bands(target_fps, duration_sec):
 # ---------------------------------------------------------------------------
 
 def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, rng):
-    """
-    Sposta i landmark con logica anatomica specifica per gruppo, con
-    intensita' indipendenti per gruppo (guidate dalle bande audio a monte).
-    Ricalcolato ogni frame a partire dai landmark ORIGINALI: la geometria
-    reagisce in tempo reale all'energia della musica, non solo cresce.
-    """
+    """Sposta i landmark per gruppo (occhi/bocca/mascella/naso), intensita' indipendenti."""
     displaced = pts.copy()
 
     eye_r_center = pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0)
@@ -332,12 +307,7 @@ def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, rng):
 
 
 def compute_displacement_field(src_pts, dst_pts, shape, eval_scale=0.2):
-    """
-    Interpola lo spostamento landmark->landmark su un campo denso (via RBF
-    thin-plate-spline), calcolato a bassa risoluzione per velocita' e poi
-    ricampionato alla risoluzione piena. I bordi immagine sono ancorati a
-    spostamento zero cosi' il warp resta confinato al volto.
-    """
+    """Interpola lo spostamento landmark->landmark su campo denso via RBF (a bassa risoluzione, poi upscale)."""
     h, w = shape[:2]
     eh, ew = max(int(h * eval_scale), 40), max(int(w * eval_scale), 40)
     sx, sy = w / ew, h / eh
@@ -370,15 +340,9 @@ def compute_displacement_field(src_pts, dst_pts, shape, eval_scale=0.2):
 
 
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
-                            seed, base_intensity, w_bass, w_mid, w_high, growth_rate):
-    """
-    Motore principale: deformazione REALE ancorata ai 68 landmark del volto.
-    - una componente permanente e crescente (danno progressivo, velocita'
-      legata a growth_rate e all'energia media della musica)
-    - una componente istantanea proporzionale alle 3 bande audio, ognuna
-      pesata dai controlli utente (w_bass -> mascella, w_mid -> bocca,
-      w_high -> occhi)
-    """
+                            seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
+                            writer):
+    """Deforma il volto sui landmark: bassi->mascella, medi->bocca, alti->occhi."""
     rng = np.random.default_rng(seed)
     h, w = base_img.shape[:2]
     xx_base, yy_base = np.meshgrid(np.arange(w).astype(np.float32),
@@ -386,7 +350,6 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
 
     total_frames = len(env_bass)
     growth_acc = 0.0
-    frames = []
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -409,9 +372,9 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         frame = cv2.remap(base_img, new_x, new_y, interpolation=cv2.INTER_LINEAR,
                            borderMode=cv2.BORDER_REFLECT)
         frame = clinical_grade(frame)
-        frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+        writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
 
-    return frames
+
 
 
 # ---------------------------------------------------------------------------
@@ -513,10 +476,10 @@ def voronoi_fracture_frame(img, region_mask, intensity, n_points, rng):
 
 
 def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
-                    seed, base_intensity, n_points, growth_rate):
+                    seed, base_intensity, n_points, growth_rate, writer):
+    """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM)."""
     rng_seed_stream = np.random.default_rng(seed)
     total_frames = len(env_bass)
-    frames = []
     growth_acc = 0.0
     seed_offset = 0
 
@@ -532,10 +495,9 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
         intensity = 0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)
         frame = voronoi_fracture_frame(base_img, region_mask, intensity, n_points, local_rng)
         frame = clinical_grade(frame)
-        frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+        writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
 
     _ = rng_seed_stream
-    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +505,8 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
 # ---------------------------------------------------------------------------
 
 def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_high,
-                            beat_frames, seed, base_intensity, n_walkers=40):
+                            beat_frames, seed, base_intensity, writer, n_walkers=40):
+    """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM)."""
     rng = np.random.default_rng(seed)
     h, w = base_img.shape[:2]
 
@@ -576,7 +539,6 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
     vein_mask = np.zeros((h, w), dtype=np.float32)
     bleed_color = np.array([0.05, 0.02, 0.35], dtype=np.float32)  # BGR rosso scuro
 
-    frames = []
     total_frames = len(env_bass)
     max_walkers = n_walkers * 5
 
@@ -622,22 +584,16 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
         alpha = vein_blur[..., None] * (0.4 + 0.5 * eb) * base_intensity
         frame = base_img * (1 - alpha) + bleed_color * alpha
         frame = clinical_grade(frame)
-        frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
-
-    return frames
+        writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
 
 
 # ---------------------------------------------------------------------------
-# EXPORT VIDEO (invariato, gia' testato)
+# EXPORT VIDEO (streaming diretto su disco, mai l'intero video in RAM)
 # ---------------------------------------------------------------------------
 
-def write_raw_video(frames, fps, out_path):
-    h, w = frames[0].shape[:2]
+def open_video_writer(out_path, fps, width, height):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-    for fr in frames:
-        writer.write(fr)
-    writer.release()
+    return cv2.VideoWriter(out_path, fourcc, fps, (width, height))
 
 
 def finalize_video(raw_video_path, audio_path, duration_sec, out_path):
@@ -906,32 +862,37 @@ def main():
             progress.progress(35, text="Rendering frame / Rendering frames...")
             t0 = time.time()
 
-            if style_key == STYLE_ANATOMICAL:
-                frames = render_anatomical_warp(
-                    base_img, pts, env_bass, env_mid, env_high, beat_frames, int(seed),
-                    base_intensity=float(aw_intensity), w_bass=float(w_bass),
-                    w_mid=float(w_mid), w_high=float(w_high), growth_rate=float(aw_growth),
-                )
-            elif style_key == STYLE_VORONOI:
-                frames = render_voronoi(
-                    base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
-                    int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
-                    n_points=int(vf_points), growth_rate=float(vf_growth),
-                )
-            elif style_key == STYLE_CAPILLARY:
-                frames = render_capillary_bleed(
-                    base_img, region_mask, pts, env_bass, env_mid, env_high, beat_frames,
-                    int(seed), base_intensity=float(cb_intensity), n_walkers=int(cb_walkers),
-                )
-            else:
-                st.error("Stile non riconosciuto. / Unrecognized style.")
-                return
+            raw_video_path = os.path.join(tmpdir, "raw.mp4")
+            writer = open_video_writer(raw_video_path, fps, target_w, target_h)
+
+            try:
+                if style_key == STYLE_ANATOMICAL:
+                    render_anatomical_warp(
+                        base_img, pts, env_bass, env_mid, env_high, beat_frames, int(seed),
+                        base_intensity=float(aw_intensity), w_bass=float(w_bass),
+                        w_mid=float(w_mid), w_high=float(w_high),
+                        growth_rate=float(aw_growth), writer=writer,
+                    )
+                elif style_key == STYLE_VORONOI:
+                    render_voronoi(
+                        base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
+                        int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
+                        n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
+                    )
+                elif style_key == STYLE_CAPILLARY:
+                    render_capillary_bleed(
+                        base_img, region_mask, pts, env_bass, env_mid, env_high, beat_frames,
+                        int(seed), base_intensity=float(cb_intensity), writer=writer,
+                        n_walkers=int(cb_walkers),
+                    )
+                else:
+                    st.error("Stile non riconosciuto. / Unrecognized style.")
+                    return
+            finally:
+                writer.release()
 
             elapsed = time.time() - t0
             progress.progress(70, text=f"Frame renderizzati in {elapsed:.1f}s / Encoding...")
-
-            raw_video_path = os.path.join(tmpdir, "raw.mp4")
-            write_raw_video(frames, fps, raw_video_path)
 
             progress.progress(85, text="Transcodifica H.264 + mux audio / "
                                         "H.264 transcode + audio mux...")
