@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 import soundfile as sf
 import streamlit as st
-from scipy.interpolate import RBFInterpolator
 from scipy.spatial import cKDTree
 
 try:
@@ -36,11 +35,13 @@ APP_TITLE = "BodyError // Loop507"
 STYLE_ANATOMICAL = "anatomical_warp"
 STYLE_VORONOI = "voronoi_fracture"
 STYLE_CAPILLARY = "capillary_bleed"
+STYLE_COMBO = "voronoi_capillary_combo"
 
 STYLE_LABELS = {
     STYLE_ANATOMICAL: "Anatomical Warp",
     STYLE_VORONOI: "Voronoi Fracture",
     STYLE_CAPILLARY: "Capillary Bleed",
+    STYLE_COMBO: "Voronoi + Capillary (combo)",
 }
 
 ASPECT_PRESETS = {
@@ -76,6 +77,22 @@ LANDMARK_GROUPS = {
 # UTILITY IMMAGINE (invariate, gia' testate)
 # ---------------------------------------------------------------------------
 
+def compute_fit_aspect_crop(src_w, src_h, target_w, target_h):
+    """Calcola il rettangolo di center-crop (x0, y0, w, h) che porta l'immagine
+    sorgente all'aspect ratio target, senza deformarla."""
+    target_ratio = target_w / target_h
+    src_ratio = src_w / src_h
+
+    if src_ratio > target_ratio:
+        crop_w = int(src_h * target_ratio)
+        x0 = (src_w - crop_w) // 2
+        return x0, 0, crop_w, src_h
+    else:
+        crop_h = int(src_w / target_ratio)
+        y0 = (src_h - crop_h) // 2
+        return 0, y0, src_w, crop_h
+
+
 def load_image_fit_aspect(path, target_w, target_h):
     """Carica l'immagine e la adatta alla risoluzione target (center-crop + resize)."""
     img = cv2.imread(path)
@@ -83,17 +100,8 @@ def load_image_fit_aspect(path, target_w, target_h):
         raise ValueError("Immagine non leggibile / Image could not be read")
 
     h, w = img.shape[:2]
-    target_ratio = target_w / target_h
-    src_ratio = w / h
-
-    if src_ratio > target_ratio:
-        new_w = int(h * target_ratio)
-        x0 = (w - new_w) // 2
-        img = img[:, x0:x0 + new_w]
-    else:
-        new_h = int(w / target_ratio)
-        y0 = (h - new_h) // 2
-        img = img[y0:y0 + new_h, :]
+    x0, y0, crop_w, crop_h = compute_fit_aspect_crop(w, h, target_w, target_h)
+    img = img[y0:y0 + crop_h, x0:x0 + crop_w]
 
     interp = cv2.INTER_AREA if img.shape[0] > target_h else cv2.INTER_LANCZOS4
     img = cv2.resize(img, (target_w, target_h), interpolation=interp)
@@ -188,6 +196,25 @@ def detect_landmarks(img_float_bgr):
     shape = predictor(gray, faces[0])
     pts = np.array([[p.x, p.y] for p in shape.parts()], dtype=np.float32)
     return pts
+
+
+def detect_landmarks_at_resolution(img_path, target_w, target_h):
+    """Rileva i landmark sull'immagine ORIGINALE intera (il rilevamento e'
+    molto piu' affidabile a piena inquadratura che su crop stretti/piccoli),
+    poi proietta i punti nelle coordinate del crop+resize finale."""
+    orig = cv2.imread(img_path)
+    if orig is None:
+        return None
+    oh, ow = orig.shape[:2]
+    orig_float = orig.astype(np.float32) / 255.0
+    pts = detect_landmarks(orig_float)
+    if pts is None:
+        return None
+
+    x0, y0, crop_w, crop_h = compute_fit_aspect_crop(ow, oh, target_w, target_h)
+    scale = np.array([target_w / crop_w, target_h / crop_h], dtype=np.float32)
+    pts_mapped = (pts - np.array([x0, y0], dtype=np.float32)) * scale
+    return pts_mapped.astype(np.float32)
 
 
 
@@ -306,50 +333,100 @@ def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, rng):
     return displaced
 
 
-def compute_displacement_field(src_pts, dst_pts, shape, eval_scale=0.2):
-    """Interpola lo spostamento landmark->landmark su campo denso via RBF (a bassa risoluzione, poi upscale)."""
+def build_face_mesh_points(pts, shape):
+    """Landmark + punti sul contorno (hull espanso) per estendere la mesh
+    oltre il volto stretto, cosi' il warp non si ferma bruscamente al bordo."""
     h, w = shape[:2]
-    eh, ew = max(int(h * eval_scale), 40), max(int(w * eval_scale), 40)
-    sx, sy = w / ew, h / eh
+    hull = cv2.convexHull(pts.astype(np.int32)).reshape(-1, 2)
+    hull_center = hull.mean(axis=0)
+    hull_expanded = (hull_center + (hull - hull_center) * 1.35).astype(np.float32)
+    hull_expanded[:, 0] = np.clip(hull_expanded[:, 0], 1, w - 2)
+    hull_expanded[:, 1] = np.clip(hull_expanded[:, 1], 1, h - 2)
 
-    pts_s = src_pts / np.array([sx, sy])
-    disp_s = dst_pts / np.array([sx, sy])
+    all_pts = np.concatenate([pts, hull_expanded], axis=0).astype(np.float32)
+    all_pts[:, 0] = np.clip(all_pts[:, 0], 1, w - 2)
+    all_pts[:, 1] = np.clip(all_pts[:, 1], 1, h - 2)
+    return all_pts, hull_expanded
 
-    border = np.array([
-        [-0.2 * ew, -0.2 * eh], [ew * 0.5, -0.2 * eh], [ew * 1.2, -0.2 * eh],
-        [-0.2 * ew, eh * 0.5], [ew * 1.2, eh * 0.5],
-        [-0.2 * ew, eh * 1.2], [ew * 0.5, eh * 1.2], [ew * 1.2, eh * 1.2],
-    ], dtype=np.float32)
 
-    src_full = np.concatenate([pts_s, border], axis=0)
-    dst_full = np.concatenate([disp_s, border], axis=0)
-    displacement = dst_full - src_full
+def get_delaunay_triangle_indices(rect, points):
+    """Triangolazione Delaunay -> lista di triple di INDICI (non coordinate)."""
+    subdiv = cv2.Subdiv2D(rect)
+    pts_list = [(float(p[0]), float(p[1])) for p in points]
+    for p in pts_list:
+        subdiv.insert(p)
 
-    rbf_x = RBFInterpolator(src_full, displacement[:, 0], kernel="thin_plate_spline")
-    rbf_y = RBFInterpolator(src_full, displacement[:, 1], kernel="thin_plate_spline")
+    coord_to_idx = {(round(p[0], 1), round(p[1], 1)): i for i, p in enumerate(pts_list)}
+    triangles_idx = []
+    for t in subdiv.getTriangleList():
+        tri_pts = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
+        idx = [coord_to_idx[(round(tp[0], 1), round(tp[1], 1))] for tp in tri_pts
+               if (round(tp[0], 1), round(tp[1], 1)) in coord_to_idx]
+        if len(idx) == 3:
+            triangles_idx.append(tuple(idx))
+    return triangles_idx
 
-    xx, yy = np.meshgrid(np.arange(ew), np.arange(eh))
-    grid = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float32)
 
-    dx_small = rbf_x(grid).reshape(eh, ew).astype(np.float32)
-    dy_small = rbf_y(grid).reshape(eh, ew).astype(np.float32)
+def warp_triangle(src_img, dst_img, t_src, t_dst):
+    """Trasforma affine un singolo triangolo da src a dst e lo fonde in dst_img."""
+    h_img, w_img = dst_img.shape[:2]
+    r1 = cv2.boundingRect(np.float32([t_src]))
+    r2 = cv2.boundingRect(np.float32([t_dst]))
 
-    dx_full = cv2.resize(dx_small, (w, h), interpolation=cv2.INTER_CUBIC) * sx
-    dy_full = cv2.resize(dy_small, (w, h), interpolation=cv2.INTER_CUBIC) * sy
-    return dx_full, dy_full
+    x2, y2, w2, h2 = r2
+    x2c, y2c = max(x2, 0), max(y2, 0)
+    w2c = min(x2 + w2, w_img) - x2c
+    h2c = min(y2 + h2, h_img) - y2c
+    if r1[2] <= 0 or r1[3] <= 0 or w2c <= 0 or h2c <= 0:
+        return
+
+    t1_rect = [(t_src[i][0] - r1[0], t_src[i][1] - r1[1]) for i in range(3)]
+    t2_rect = [(t_dst[i][0] - r2[0], t_dst[i][1] - r2[1]) for i in range(3)]
+
+    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
+    cv2.fillConvexPoly(mask, np.int32(t2_rect), (1.0, 1.0, 1.0), cv2.LINE_AA)
+
+    img1_rect = src_img[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]]
+    if img1_rect.size == 0:
+        return
+    warp_mat = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
+    img2_rect = cv2.warpAffine(img1_rect, warp_mat, (r2[2], r2[3]), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REFLECT_101)
+    img2_rect = img2_rect * mask
+
+    oy0, ox0 = y2c - r2[1], x2c - r2[0]
+    img2_rect_c = img2_rect[oy0:oy0 + h2c, ox0:ox0 + w2c]
+    mask_c = mask[oy0:oy0 + h2c, ox0:ox0 + w2c]
+
+    dst_slice = dst_img[y2c:y2c + h2c, x2c:x2c + w2c]
+    dst_slice[:] = dst_slice * (1 - mask_c) + img2_rect_c
+
+
+def warp_face_mesh(base_img, all_src_pts, displaced_landmarks, hull_expanded, triangles_idx):
+    all_dst_pts = np.concatenate([displaced_landmarks, hull_expanded], axis=0).astype(np.float32)
+    output = base_img.copy()
+    for idx in triangles_idx:
+        t_src = [tuple(all_src_pts[i]) for i in idx]
+        t_dst = [tuple(all_dst_pts[i]) for i in idx]
+        warp_triangle(base_img, output, t_src, t_dst)
+    return output
 
 
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
                             seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
                             writer):
-    """Deforma il volto sui landmark: bassi->mascella, medi->bocca, alti->occhi."""
+    """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark:
+    bassi->mascella, medi->bocca, alti->occhi. Sfaccettature nette per
+    triangolo, non un campo morbido continuo."""
     rng = np.random.default_rng(seed)
+    all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
     h, w = base_img.shape[:2]
-    xx_base, yy_base = np.meshgrid(np.arange(w).astype(np.float32),
-                                    np.arange(h).astype(np.float32))
+    triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
 
     total_frames = len(env_bass)
     growth_acc = 0.0
+    fx_state = create_fx_state()
+    rng_fx = np.random.default_rng(seed + 999_983)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -369,18 +446,11 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
             jaw_i *= 1.4
 
         displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, rng)
-        dx, dy = compute_displacement_field(pts, displaced, base_img.shape)
-
-        new_x = np.clip(xx_base + dx, 0, w - 1)
-        new_y = np.clip(yy_base + dy, 0, h - 1)
-        frame = cv2.remap(base_img, new_x, new_y, interpolation=cv2.INTER_LINEAR,
-                           borderMode=cv2.BORDER_REFLECT)
+        frame = warp_face_mesh(base_img, all_src_pts, displaced, hull_expanded, triangles_idx)
         frame = clinical_grade(frame)
-        writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
-
-
-
-
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
+        writer.write(frame_u8)
 # ---------------------------------------------------------------------------
 # STILE: VORONOI FRACTURE (rifatto: niente linee finte, contenuto reale
 # nei varchi, separazione guidata dai bassi)
@@ -497,6 +567,8 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
 
     cache_rng = np.random.default_rng(seed)
     points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+    fx_state = create_fx_state()
+    rng_fx = np.random.default_rng(seed + 999_983)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -516,7 +588,9 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
         frame = apply_voronoi_displacement(base_img, points, labels, intensity, disp_rng)
         frame = clinical_grade(frame)
-        writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
+        writer.write(frame_u8)
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +634,8 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
 
     total_frames = len(env_bass)
     max_walkers = n_walkers * 5
+    fx_state = create_fx_state()
+    rng_fx = np.random.default_rng(seed + 999_983)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -605,7 +681,154 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
         alpha = vein_blur[..., None] * (0.4 + 0.5 * eb) * base_intensity * breathing
         frame = base_img * (1 - alpha) + bleed_color * alpha
         frame = clinical_grade(frame)
-        writer.write((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
+        writer.write(frame_u8)
+
+
+# ---------------------------------------------------------------------------
+# STILE: VORONOI + CAPILLARY (combo) - il volto si frattura in placche E
+# sanguina lungo le crepe tra i pezzi (venature seminate sui bordi Voronoi
+# invece che sui landmark del volto)
+# ---------------------------------------------------------------------------
+
+def crack_seeds_from_labels(labels, n_seeds, rng, w, h):
+    gx = cv2.Sobel(labels.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(labels.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    boundary = (np.abs(gx) + np.abs(gy)) > 0
+    ys, xs = np.where(boundary)
+    if len(xs) == 0:
+        return np.array([[w / 2, h / 2]], dtype=np.float32)
+    idx = rng.choice(len(xs), min(n_seeds, len(xs)), replace=False)
+    return np.stack([xs[idx], ys[idx]], axis=1).astype(np.float32)
+
+
+def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env_high,
+                                    beat_frames, seed, base_intensity, n_points,
+                                    growth_rate, writer):
+    h, w = base_img.shape[:2]
+    total_frames = len(env_bass)
+    growth_acc = 0.0
+    seed_offset = 0
+    rng = np.random.default_rng(seed)
+
+    cache_rng = np.random.default_rng(seed)
+    points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+
+    n_walkers = max(n_points, 20)
+    walker_pos = crack_seeds_from_labels(labels, n_walkers, rng, w, h)
+    walker_dir = rng.uniform(-1, 1, walker_pos.shape).astype(np.float32)
+    vein_mask = np.zeros((h, w), dtype=np.float32)
+    bleed_color = np.array([0.05, 0.02, 0.35], dtype=np.float32)
+
+    gray = cv2.cvtColor((base_img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    gx_img = cv2.Sobel(gray_blur, cv2.CV_32F, 1, 0, ksize=5)
+    gy_img = cv2.Sobel(gray_blur, cv2.CV_32F, 0, 1, ksize=5)
+    mag = np.sqrt(gx_img ** 2 + gy_img ** 2) + 1e-6
+    gx_n = gx_img / mag
+    gy_n = gy_img / mag
+
+    max_walkers = n_walkers * 4
+    fx_state = create_fx_state()
+    rng_fx = np.random.default_rng(seed + 999_983)
+
+    for f in range(total_frames):
+        eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
+        avg_e = (eb + em + eh_) / 3.0
+        growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
+
+        if f in beat_frames:
+            seed_offset += 1
+            cache_rng = np.random.default_rng(seed + seed_offset)
+            points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+            new_seeds = crack_seeds_from_labels(labels, 5, rng, w, h)
+            walker_pos = np.concatenate([walker_pos, new_seeds], axis=0)
+            walker_dir = np.concatenate(
+                [walker_dir, rng.uniform(-1, 1, new_seeds.shape).astype(np.float32)], axis=0)
+
+        breathing = float(0.85 + 0.15 * np.sin(f / max(total_frames, 1) * np.pi * 6))
+        frac_intensity = (0.08 + base_intensity * (growth_acc * 0.4 + eb * 0.4)) * breathing
+
+        disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
+        fractured = apply_voronoi_displacement(base_img, points, labels, frac_intensity, disp_rng)
+
+        step_size = 1.0 + 2.5 * em
+        xi = np.clip(walker_pos[:, 0].astype(int), 0, w - 1)
+        yi = np.clip(walker_pos[:, 1].astype(int), 0, h - 1)
+        tangent_x = -gy_n[yi, xi]
+        tangent_y = gx_n[yi, xi]
+        rand_perturb = rng.uniform(-0.4, 0.4, walker_dir.shape).astype(np.float32)
+        walker_dir = (0.7 * walker_dir + 0.3 * np.stack([tangent_x, tangent_y], axis=1)
+                      + rand_perturb)
+        norm = np.linalg.norm(walker_dir, axis=1, keepdims=True) + 1e-6
+        walker_dir = walker_dir / norm
+        walker_pos = walker_pos + walker_dir * step_size
+        walker_pos[:, 0] = np.clip(walker_pos[:, 0], 0, w - 1)
+        walker_pos[:, 1] = np.clip(walker_pos[:, 1], 0, h - 1)
+        xi2 = walker_pos[:, 0].astype(int)
+        yi2 = walker_pos[:, 1].astype(int)
+        vein_mask[yi2, xi2] = 1.0
+
+        branch_prob = eh_ * 0.4
+        if (f in beat_frames or rng.uniform(0, 1) < branch_prob) and len(walker_pos) < max_walkers:
+            n_new = min(3, n_walkers)
+            branch_idx = rng.integers(0, len(walker_pos), n_new)
+            new_pos = walker_pos[branch_idx] + rng.uniform(-2, 2, (n_new, 2))
+            new_pos[:, 0] = np.clip(new_pos[:, 0], 0, w - 1)
+            new_pos[:, 1] = np.clip(new_pos[:, 1], 0, h - 1)
+            new_dir = rng.uniform(-1, 1, (n_new, 2)).astype(np.float32)
+            walker_pos = np.concatenate([walker_pos, new_pos.astype(np.float32)], axis=0)
+            walker_dir = np.concatenate([walker_dir, new_dir], axis=0)
+
+        vein_blur = cv2.GaussianBlur(vein_mask, (3, 3), 0)
+        vein_blur = np.clip(vein_blur * region_mask, 0, 1)
+        alpha = vein_blur[..., None] * (0.4 + 0.5 * eb) * base_intensity * 0.9
+        frame = fractured * (1 - alpha) + bleed_color * alpha
+        frame = clinical_grade(frame)
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
+        writer.write(frame_u8)
+
+
+# ---------------------------------------------------------------------------
+# MONTAGGIO A TEMPO (zoom-punch, flash, freeze sincronizzati al beat)
+# ---------------------------------------------------------------------------
+
+def create_fx_state():
+    return {"zoom": 0.0, "freeze_left": 0, "frozen_frame": None}
+
+
+def apply_beat_fx(frame_u8, f, beat_frames, eb, state, rng):
+    """Applica in coda alla pipeline: punch-in sullo zoom al beat (con decadimento),
+    freeze occasionale (stuttering), flash breve sui colpi di bassi piu' forti."""
+    if state["freeze_left"] > 0:
+        state["freeze_left"] -= 1
+        return state["frozen_frame"]
+
+    h, w = frame_u8.shape[:2]
+    triggered_beat = f in beat_frames
+
+    state["zoom"] *= 0.72
+    if triggered_beat:
+        state["zoom"] = 0.09 + 0.05 * eb
+        if rng.uniform(0, 1) < 0.10:
+            state["freeze_left"] = int(rng.integers(2, 5))
+
+    out = frame_u8
+    if state["zoom"] > 0.003:
+        scale = 1.0 + state["zoom"]
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(frame_u8, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        x0, y0 = (new_w - w) // 2, (new_h - h) // 2
+        out = resized[y0:y0 + h, x0:x0 + w]
+
+    if triggered_beat and eb > 0.6:
+        flash_amt = min((eb - 0.6) / 0.4, 1.0) * 90
+        out = np.clip(out.astype(np.float32) + flash_amt, 0, 255).astype(np.uint8)
+
+    state["frozen_frame"] = out
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +962,11 @@ def main():
                                   key="aw_intensity")
         aw_growth = st.slider("Velocita' progressione permanente / Permanent growth rate",
                                0.5, 5.0, 2.0, 0.5, key="aw_growth")
-    with st.expander("Voronoi Fracture", expanded=(style_key == STYLE_VORONOI)):
+    with st.expander("Voronoi Fracture",
+                      expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
+        if style_key == STYLE_COMBO:
+            st.caption("Usati anche dal combo Voronoi + Capillary. / "
+                       "Also used by the Voronoi + Capillary combo.")
         vf_intensity = st.slider("Intensita' frattura / Fracture intensity", 0.2, 3.0, 1.0,
                                   0.1, key="vf_intensity")
         vf_points = st.slider("Numero placche / Number of pieces", 10, 60, 26, 2,
@@ -816,9 +1043,19 @@ def main():
     seed = st.number_input("Seed", min_value=0, value=7, step=1, key="input_seed")
     fps = 24
 
-    render_clicked = st.button("Genera / Render", type="primary", key="button_render")
+    col_render1, col_render2 = st.columns(2)
+    with col_render1:
+        render_clicked = st.button("Genera / Render", type="primary", key="button_render")
+    with col_render2:
+        preview_clicked = st.button(
+            "Anteprima rapida 3s / Quick 3s preview", key="button_preview",
+            help="Render veloce a bassa risoluzione per testare le impostazioni "
+                 "senza consumare troppa CPU. / Fast low-res render to test "
+                 "settings without using too much CPU.",
+        )
 
-    if render_clicked:
+    def do_render(render_w, render_h, render_duration, output_key, report_key,
+                   progress_label_prefix=""):
         if image_file is None:
             st.error("Carica una foto prima di procedere. / Upload a photo first.")
             return
@@ -827,11 +1064,8 @@ def main():
                       "dlib not available: cannot proceed.")
             return
 
-        # Pulisce il risultato precedente PRIMA di iniziare: se questo render
-        # fallisce o va in timeout, l'utente non deve vedere/scaricare per
-        # sbaglio il video di un tentativo precedente con altre impostazioni.
-        st.session_state.output_path = None
-        st.session_state.report_text = None
+        st.session_state[output_key] = None
+        st.session_state[report_key] = None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             img_path = os.path.join(tmpdir, "input.jpg")
@@ -844,24 +1078,24 @@ def main():
                 with open(audio_path, "wb") as fh:
                     fh.write(audio_file.getvalue())
 
-            progress = st.progress(0, text="Analisi audio / Audio analysis...")
+            progress = st.progress(0, text=progress_label_prefix + "Analisi audio / Audio analysis...")
 
             bpm_value = None
             if audio_path is not None and LIBROSA_OK:
                 env_bass, env_mid, env_high, beat_frames, bpm_value = analyze_audio_bands(
-                    audio_path, fps, duration_sec)
+                    audio_path, fps, render_duration)
             else:
                 if audio_path is not None and not LIBROSA_OK:
                     st.warning("librosa non disponibile: uso envelope sintetico. / "
                                "librosa unavailable: using synthetic envelope.")
                 env_bass, env_mid, env_high, beat_frames, bpm_value = synthetic_bands(
-                    fps, duration_sec)
+                    fps, render_duration)
 
-            progress.progress(15, text="Caricamento immagine / Loading image...")
-            base_img = load_image_fit_aspect(img_path, target_w, target_h)
+            progress.progress(15, text=progress_label_prefix + "Caricamento immagine / Loading image...")
+            base_img = load_image_fit_aspect(img_path, render_w, render_h)
 
-            progress.progress(25, text="Rilevamento volto / Face detection...")
-            pts = detect_landmarks(base_img)
+            progress.progress(25, text=progress_label_prefix + "Rilevamento volto / Face detection...")
+            pts = detect_landmarks_at_resolution(img_path, render_w, render_h)
             if pts is None:
                 st.warning(
                     "Nessun volto rilevato: gli stili basati sui landmark saranno "
@@ -869,9 +1103,6 @@ def main():
                     "limited."
                 )
 
-            # Voronoi e Capillary Bleed devono coprire l'intero soggetto (utile
-            # anche per foto a figura intera), non solo il piccolo poligono del
-            # volto - quindi usano sempre la sagoma sfondo/primo piano.
             region_mask = build_background_subject_mask(base_img)
 
             if style_key == STYLE_ANATOMICAL and pts is None:
@@ -886,11 +1117,11 @@ def main():
                 )
                 return
 
-            progress.progress(35, text="Rendering frame / Rendering frames...")
+            progress.progress(35, text=progress_label_prefix + "Rendering frame / Rendering frames...")
             t0 = time.time()
 
             raw_video_path = os.path.join(tmpdir, "raw.mp4")
-            writer = open_video_writer(raw_video_path, fps, target_w, target_h)
+            writer = open_video_writer(raw_video_path, fps, render_w, render_h)
 
             try:
                 if style_key == STYLE_ANATOMICAL:
@@ -912,6 +1143,12 @@ def main():
                         int(seed), base_intensity=float(cb_intensity), writer=writer,
                         n_walkers=int(cb_walkers),
                     )
+                elif style_key == STYLE_COMBO:
+                    render_voronoi_capillary_combo(
+                        base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
+                        int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
+                        n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
+                    )
                 else:
                     st.error("Stile non riconosciuto. / Unrecognized style.")
                     return
@@ -919,31 +1156,51 @@ def main():
                 writer.release()
 
             elapsed = time.time() - t0
-            progress.progress(70, text=f"Frame renderizzati in {elapsed:.1f}s / Encoding...")
+            progress.progress(70, text=f"{progress_label_prefix}Frame renderizzati in "
+                                        f"{elapsed:.1f}s / Encoding...")
 
-            progress.progress(85, text="Transcodifica H.264 + mux audio / "
+            progress.progress(85, text=progress_label_prefix + "Transcodifica H.264 + mux audio / "
                                         "H.264 transcode + audio mux...")
             final_path = os.path.join(tmpdir, "bodyerror_output.mp4")
             try:
-                finalize_video(raw_video_path, audio_path, duration_sec, final_path)
+                finalize_video(raw_video_path, audio_path, render_duration, final_path)
             except subprocess.CalledProcessError as exc:
                 st.error(f"Errore ffmpeg / ffmpeg error: {exc.stderr.decode(errors='ignore')[-500:]}")
                 return
 
             output_bytes_path = os.path.join(tempfile.gettempdir(),
-                                              f"bodyerror_{int(time.time())}.mp4")
+                                              f"bodyerror_{output_key}_{int(time.time())}.mp4")
             with open(final_path, "rb") as src, open(output_bytes_path, "wb") as dst:
                 dst.write(src.read())
 
-            st.session_state.output_path = output_bytes_path
-            st.session_state.report_text = build_report(
-                style_key, int(seed), duration_sec, fps,
-                f"{target_w}x{target_h} ({aspect_label})",
+            st.session_state[output_key] = output_bytes_path
+            st.session_state[report_key] = build_report(
+                style_key, int(seed), render_duration, fps,
+                f"{render_w}x{render_h}",
                 audio_path is not None, bpm_value,
                 f"{w_bass:.1f} / {w_mid:.1f} / {w_high:.1f}",
             )
 
-            progress.progress(100, text="Completato / Done")
+            progress.progress(100, text=progress_label_prefix + "Completato / Done")
+
+    if render_clicked:
+        do_render(target_w, target_h, duration_sec, "output_path", "report_text")
+
+    if preview_clicked:
+        # anteprima sempre piccola e breve, indipendentemente dalle impostazioni
+        # principali, per un test rapido che non consumi troppa CPU
+        preview_ratio = target_w / target_h
+        if preview_ratio >= 1:
+            preview_w, preview_h = 320, max(int(320 / preview_ratio), 32)
+        else:
+            preview_h, preview_w = 320, max(int(320 * preview_ratio), 32)
+        do_render(preview_w, preview_h, min(duration_sec, 3), "preview_output_path",
+                  "preview_report_text", progress_label_prefix="[Anteprima] ")
+
+    if st.session_state.get("preview_output_path") and os.path.exists(
+            st.session_state["preview_output_path"]):
+        st.caption("Anteprima rapida / Quick preview")
+        st.video(st.session_state["preview_output_path"])
 
     if st.session_state.output_path and os.path.exists(st.session_state.output_path):
         st.video(st.session_state.output_path)
