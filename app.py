@@ -301,38 +301,6 @@ def synthetic_bands(target_fps, duration_sec):
 # STILE: ANATOMICAL WARP (motore principale)
 # ---------------------------------------------------------------------------
 
-def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, rng):
-    """Sposta i landmark per gruppo (occhi/bocca/mascella/naso), intensita' indipendenti."""
-    displaced = pts.copy()
-
-    eye_r_center = pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0)
-    for i in LANDMARK_GROUPS["eye_r"]:
-        displaced[i] = pts[i] + (pts[i] - eye_r_center) * (0.9 * eye_i)
-
-    eye_l_center = pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0)
-    for i in LANDMARK_GROUPS["eye_l"]:
-        displaced[i] = pts[i] - (pts[i] - eye_l_center) * (0.35 * eye_i)
-
-    mouth_center = pts[LANDMARK_GROUPS["mouth"]].mean(axis=0)
-    for i in LANDMARK_GROUPS["mouth"]:
-        dx = (pts[i][0] - mouth_center[0]) * (1.1 * mouth_i)
-        dy = 16.0 * mouth_i
-        displaced[i] = pts[i] + np.array([dx, dy])
-
-    jaw_center_x = pts[LANDMARK_GROUPS["jaw"]][:, 0].mean()
-    jaw_span = np.ptp(pts[LANDMARK_GROUPS["jaw"]][:, 0])
-    for i in LANDMARK_GROUPS["jaw"]:
-        dist_ratio = abs(pts[i][0] - jaw_center_x) / max(jaw_span / 2, 1.0)
-        dy = (32.0 + 58.0 * dist_ratio) * jaw_i
-        displaced[i] = pts[i] + np.array([rng.uniform(-3, 3), dy])
-
-    for i in LANDMARK_GROUPS["nose"]:
-        dx = rng.uniform(-3, 3) * (mouth_i * 0.3)
-        displaced[i] = pts[i] + np.array([dx, 2.0 * mouth_i * 0.3])
-
-    return displaced
-
-
 def build_face_mesh_points(pts, shape):
     """Landmark + punti sul contorno (hull espanso) per estendere la mesh
     oltre il volto stretto, cosi' il warp non si ferma bruscamente al bordo."""
@@ -359,7 +327,13 @@ def get_delaunay_triangle_indices(rect, points):
     coord_to_idx = {(round(p[0], 1), round(p[1], 1)): i for i, p in enumerate(pts_list)}
     triangles_idx = []
     for t in subdiv.getTriangleList():
-        tri_pts = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
+        # cast esplicito a float nativo Python: t arriva come numpy.float32,
+        # e round() su un numpy scalar resta un numpy scalar - confrontarlo
+        # con le chiavi (float nativo) del dizionario fallisce SEMPRE anche
+        # quando i valori "sembrano" uguali (precisione binaria diversa tra
+        # float32 e float64), azzerando silenziosamente tutti i triangoli.
+        tri_pts = [(float(t[0]), float(t[1])), (float(t[2]), float(t[3])),
+                   (float(t[4]), float(t[5]))]
         idx = [coord_to_idx[(round(tp[0], 1), round(tp[1], 1))] for tp in tri_pts
                if (round(tp[0], 1), round(tp[1], 1)) in coord_to_idx]
         if len(idx) == 3:
@@ -412,12 +386,55 @@ def warp_face_mesh(base_img, all_src_pts, displaced_landmarks, hull_expanded, tr
     return output
 
 
+def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng):
+    """Sposta i landmark per gruppo. eye_jitter aggiunge un tremore casuale
+    ad alta frequenza (ricalcolato ogni frame) sugli occhi, per un carattere
+    "nervoso" distinto dalla crescita liscia degli altri gruppi."""
+    displaced = pts.copy()
+
+    eye_r_center = pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0)
+    for i in LANDMARK_GROUPS["eye_r"]:
+        base = pts[i] + (pts[i] - eye_r_center) * (0.9 * eye_i)
+        displaced[i] = base + rng.uniform(-1, 1, 2) * eye_jitter * 7.0
+
+    eye_l_center = pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0)
+    for i in LANDMARK_GROUPS["eye_l"]:
+        base = pts[i] - (pts[i] - eye_l_center) * (0.35 * eye_i)
+        displaced[i] = base + rng.uniform(-1, 1, 2) * eye_jitter * 7.0
+
+    mouth_center = pts[LANDMARK_GROUPS["mouth"]].mean(axis=0)
+    for i in LANDMARK_GROUPS["mouth"]:
+        dx = (pts[i][0] - mouth_center[0]) * (1.1 * mouth_i)
+        dy = 16.0 * mouth_i
+        displaced[i] = pts[i] + np.array([dx, dy])
+
+    jaw_center_x = pts[LANDMARK_GROUPS["jaw"]][:, 0].mean()
+    jaw_span = np.ptp(pts[LANDMARK_GROUPS["jaw"]][:, 0])
+    for i in LANDMARK_GROUPS["jaw"]:
+        dist_ratio = abs(pts[i][0] - jaw_center_x) / max(jaw_span / 2, 1.0)
+        dy = (32.0 + 58.0 * dist_ratio) * jaw_i
+        displaced[i] = pts[i] + np.array([rng.uniform(-3, 3), dy])
+
+    for i in LANDMARK_GROUPS["nose"]:
+        dx = rng.uniform(-3, 3) * (mouth_i * 0.3)
+        displaced[i] = pts[i] + np.array([dx, 2.0 * mouth_i * 0.3])
+
+    return displaced
+
+
+def mid_gate(x, center=0.5, sharpness=12.0):
+    """Soglia morbida (sigmoide): la bocca resta quasi chiusa finche' i medi
+    non superano la soglia, poi scatta - non una sfumatura continua."""
+    return float(1.0 / (1.0 + np.exp(-sharpness * (x - center))))
+
+
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
                             seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
                             writer):
-    """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark:
-    bassi->mascella, medi->bocca, alti->occhi. Sfaccettature nette per
-    triangolo, non un campo morbido continuo."""
+    """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark.
+    Le tre bande hanno un carattere qualitativamente diverso, non solo
+    un'intensita' diversa: bassi = colpo secco sulla mascella, medi = bocca
+    che scatta aperta/chiusa a soglia, alti = tremore rapido sugli occhi."""
     rng = np.random.default_rng(seed)
     all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
     h, w = base_img.shape[:2]
@@ -425,31 +442,30 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
 
     total_frames = len(env_bass)
     growth_acc = 0.0
-    fx_state = create_fx_state()
-    rng_fx = np.random.default_rng(seed + 999_983)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
         avg_e = (eb + em + eh_) / 3.0
         growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
 
-        # respiro: oscillazione lenta cosi' la componente permanente non resta
-        # piatta una volta saturata (evita l'effetto "monotono" a lungo termine)
-        breathing = float(0.8 + 0.2 * np.sin(f / max(total_frames, 1) * np.pi * 8))
+        permanent = growth_acc * base_intensity * 0.6
 
-        permanent = growth_acc * base_intensity * 0.6 * breathing
+        # bassi: colpo secco strutturale, molto piu' forte sul beat
         jaw_i = permanent + eb * w_bass * base_intensity
-        mouth_i = permanent * 0.6 + em * w_mid * base_intensity
-        eye_i = permanent * 0.4 + eh_ * w_high * base_intensity
-
         if f in beat_frames:
-            jaw_i *= 1.4
+            jaw_i *= 2.2
 
-        displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, rng)
+        # medi: la bocca scatta aperta a soglia, non scala in modo lineare
+        mouth_i = permanent * 0.4 + w_mid * base_intensity * mid_gate(em)
+
+        # alti: componente liscia ridotta + tremore ad alta frequenza vero
+        eye_i = permanent * 0.3 + eh_ * w_high * base_intensity * 0.4
+        eye_jitter = eh_ * w_high
+
+        displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng)
         frame = warp_face_mesh(base_img, all_src_pts, displaced, hull_expanded, triangles_idx)
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
         writer.write(frame_u8)
 # ---------------------------------------------------------------------------
 # STILE: VORONOI FRACTURE (rifatto: niente linee finte, contenuto reale
@@ -567,8 +583,6 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
 
     cache_rng = np.random.default_rng(seed)
     points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
-    fx_state = create_fx_state()
-    rng_fx = np.random.default_rng(seed + 999_983)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -580,16 +594,15 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             cache_rng = np.random.default_rng(seed + seed_offset)
             points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
-        # respiro: oscillazione lenta sovrapposta alla crescita, cosi' anche
-        # a energia audio costante l'intensita' non resta piatta
-        breathing = float(0.85 + 0.15 * np.sin(f / max(total_frames, 1) * np.pi * 6))
-        intensity = (0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)) * breathing
+        # bassi: intensita' della frattura, con colpo secco sul beat
+        intensity = 0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)
+        if f in beat_frames:
+            intensity *= 1.7
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
         frame = apply_voronoi_displacement(base_img, points, labels, intensity, disp_rng)
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
         writer.write(frame_u8)
 
 
@@ -634,8 +647,6 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
 
     total_frames = len(env_bass)
     max_walkers = n_walkers * 5
-    fx_state = create_fx_state()
-    rng_fx = np.random.default_rng(seed + 999_983)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -675,14 +686,12 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
         vein_blur = cv2.GaussianBlur(vein_mask, (3, 3), 0)
         vein_blur = np.clip(vein_blur * region_mask, 0, 1)
 
-        # i BASSI pilotano lo spessore/opacita', con un lieve respiro cosi'
-        # anche a energia costante l'opacita' non resta piatta
-        breathing = float(0.85 + 0.15 * np.sin(f / max(total_frames, 1) * np.pi * 10))
-        alpha = vein_blur[..., None] * (0.4 + 0.5 * eb) * base_intensity * breathing
+        # i BASSI pilotano lo spessore/opacita', con un colpo secco sul beat
+        eb_effective = eb * 1.6 if f in beat_frames else eb
+        alpha = vein_blur[..., None] * (0.4 + 0.5 * eb_effective) * base_intensity
         frame = base_img * (1 - alpha) + bleed_color * alpha
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
         writer.write(frame_u8)
 
 
@@ -730,8 +739,6 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
     gy_n = gy_img / mag
 
     max_walkers = n_walkers * 4
-    fx_state = create_fx_state()
-    rng_fx = np.random.default_rng(seed + 999_983)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -747,8 +754,9 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
             walker_dir = np.concatenate(
                 [walker_dir, rng.uniform(-1, 1, new_seeds.shape).astype(np.float32)], axis=0)
 
-        breathing = float(0.85 + 0.15 * np.sin(f / max(total_frames, 1) * np.pi * 6))
-        frac_intensity = (0.08 + base_intensity * (growth_acc * 0.4 + eb * 0.4)) * breathing
+        frac_intensity = 0.08 + base_intensity * (growth_acc * 0.4 + eb * 0.4)
+        if f in beat_frames:
+            frac_intensity *= 1.6
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
         fractured = apply_voronoi_displacement(base_img, points, labels, frac_intensity, disp_rng)
@@ -787,48 +795,7 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
         frame = fractured * (1 - alpha) + bleed_color * alpha
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-        frame_u8 = apply_beat_fx(frame_u8, f, beat_frames, eb, fx_state, rng_fx)
         writer.write(frame_u8)
-
-
-# ---------------------------------------------------------------------------
-# MONTAGGIO A TEMPO (zoom-punch, flash, freeze sincronizzati al beat)
-# ---------------------------------------------------------------------------
-
-def create_fx_state():
-    return {"zoom": 0.0, "freeze_left": 0, "frozen_frame": None}
-
-
-def apply_beat_fx(frame_u8, f, beat_frames, eb, state, rng):
-    """Applica in coda alla pipeline: punch-in sullo zoom al beat (con decadimento),
-    freeze occasionale (stuttering), flash breve sui colpi di bassi piu' forti."""
-    if state["freeze_left"] > 0:
-        state["freeze_left"] -= 1
-        return state["frozen_frame"]
-
-    h, w = frame_u8.shape[:2]
-    triggered_beat = f in beat_frames
-
-    state["zoom"] *= 0.72
-    if triggered_beat:
-        state["zoom"] = 0.09 + 0.05 * eb
-        if rng.uniform(0, 1) < 0.10:
-            state["freeze_left"] = int(rng.integers(2, 5))
-
-    out = frame_u8
-    if state["zoom"] > 0.003:
-        scale = 1.0 + state["zoom"]
-        new_w, new_h = int(w * scale), int(h * scale)
-        resized = cv2.resize(frame_u8, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        x0, y0 = (new_w - w) // 2, (new_h - h) // 2
-        out = resized[y0:y0 + h, x0:x0 + w]
-
-    if triggered_beat and eb > 0.6:
-        flash_amt = min((eb - 0.6) / 0.4, 1.0) * 90
-        out = np.clip(out.astype(np.float32) + flash_amt, 0, 255).astype(np.uint8)
-
-    state["frozen_frame"] = out
-    return out
 
 
 # ---------------------------------------------------------------------------
