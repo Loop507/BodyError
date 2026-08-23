@@ -848,39 +848,48 @@ def build_report(style_key, seed, duration_sec, fps, resolution, has_audio, bpm_
     audio_line_it = f"BPM rilevato: {bpm_value:.1f}" if bpm_value else "Nessun audio: envelope sintetico"
     audio_line_en = f"Detected BPM: {bpm_value:.1f}" if bpm_value else "No audio: synthetic envelope"
     style_tag = STYLE_HASHTAGS.get(style_key, "")
+    hashtags = (f"#generativeart #creativecoding #algorithmicart #puredsp #dlib "
+                f"{style_tag} #hyperrealism #uncannyvalley #clinicalsurrealism "
+                f"#audiovisualart #techno")
 
     report = f"""
-[BodyError] // Vol. {vol_number:03d} :: REPORT
-
 [IT]
+[BodyError] //  Vol. {vol_number:03d}
+:: REPORT
 Stile: {style_label}
 Seed: {seed}
 Durata: {duration_sec:.1f}s @ {fps}fps
 Risoluzione: {resolution}
 Audio: {"presente" if has_audio else "assente"} — {audio_line_it}
 Pesi banda (bassi/medi/alti): {weights_used}
-Tecnica: landmark del volto (dlib, 68 punti) + DSP puro ::
-Riferimenti estetici:
+Tecnica: landmark del volto (dlib, 68 punti) + DSP puro
+:: Riferimenti estetici:
 Plastinazione Anatomica
-Iperrealismo Scultoreo Clinico ::
-Reinterpretati come Processo Algoritmico.
+Iperrealismo Scultoreo Clinico
+:: Reinterpretati come Processo Algoritmico.
+
+Direction & Algorithm: Loop507
+
+{hashtags}
 
 [EN]
+[BodyError] //  Vol. {vol_number:03d}
+:: REPORT
 Style: {style_label}
 Seed: {seed}
 Duration: {duration_sec:.1f}s @ {fps}fps
 Resolution: {resolution}
 Audio: {"present" if has_audio else "none"} — {audio_line_en}
 Band weights (bass/mid/high): {weights_used}
-Technique: face landmarks (dlib, 68 points) + pure DSP ::
-Aesthetic references:
+Technique: face landmarks (dlib, 68 points) + pure DSP
+:: Aesthetic references:
 Anatomical Plastination
-Clinical Hyperrealist Sculpture ::
-Reinterpreted as an Algorithmic Process.
+Clinical Hyperrealist Sculpture
+:: Reinterpreted as an Algorithmic Process.
 
 Direction & Algorithm: Loop507
-#generativeart #creativecoding #algorithmicart #puredsp #dlib {style_tag} \
-#hyperrealism #uncannyvalley #clinicalsurrealism #audiovisualart
+
+{hashtags}
 """.strip()
     return report
 
