@@ -834,14 +834,23 @@ def finalize_video(raw_video_path, audio_path, duration_sec, out_path):
 # REPORT BILINGUE
 # ---------------------------------------------------------------------------
 
+STYLE_HASHTAGS = {
+    STYLE_ANATOMICAL: "#anatomicalwarp",
+    STYLE_VORONOI: "#voronoifracture",
+    STYLE_CAPILLARY: "#capillarybleed",
+    STYLE_COMBO: "#voronoicapillary",
+}
+
+
 def build_report(style_key, seed, duration_sec, fps, resolution, has_audio, bpm_value,
-                  weights_used):
+                  weights_used, vol_number):
     style_label = STYLE_LABELS[style_key]
     audio_line_it = f"BPM rilevato: {bpm_value:.1f}" if bpm_value else "Nessun audio: envelope sintetico"
     audio_line_en = f"Detected BPM: {bpm_value:.1f}" if bpm_value else "No audio: synthetic envelope"
+    style_tag = STYLE_HASHTAGS.get(style_key, "")
 
     report = f"""
-BodyError // Loop507 :: REPORT
+[BodyError] // Vol. {vol_number:03d} :: REPORT
 
 [IT]
 Stile: {style_label}
@@ -850,10 +859,11 @@ Durata: {duration_sec:.1f}s @ {fps}fps
 Risoluzione: {resolution}
 Audio: {"presente" if has_audio else "assente"} — {audio_line_it}
 Pesi banda (bassi/medi/alti): {weights_used}
-Tecnica: landmark del volto (dlib, 68 punti) + DSP puro (OpenCV/NumPy/SciPy),
-nessuna rete neurale generativa.
-Riferimenti estetici: plastinazione anatomica (von Hagens), iperrealismo
-scultoreo clinico (Mueck, Jinks) — reinterpretati come processo algoritmico.
+Tecnica: landmark del volto (dlib, 68 punti) + DSP puro ::
+Riferimenti estetici:
+Plastinazione Anatomica
+Iperrealismo Scultoreo Clinico ::
+Reinterpretati come Processo Algoritmico.
 
 [EN]
 Style: {style_label}
@@ -862,10 +872,15 @@ Duration: {duration_sec:.1f}s @ {fps}fps
 Resolution: {resolution}
 Audio: {"present" if has_audio else "none"} — {audio_line_en}
 Band weights (bass/mid/high): {weights_used}
-Technique: face landmarks (dlib, 68 points) + pure DSP (OpenCV/NumPy/SciPy),
-no generative neural network.
-Aesthetic references: anatomical plastination (von Hagens), clinical
-hyperrealist sculpture (Mueck, Jinks) — reinterpreted as an algorithmic process.
+Technique: face landmarks (dlib, 68 points) + pure DSP ::
+Aesthetic references:
+Anatomical Plastination
+Clinical Hyperrealist Sculpture ::
+Reinterpreted as an Algorithmic Process.
+
+Direction & Algorithm: Loop507
+#generativeart #creativecoding #algorithmicart #puredsp #dlib {style_tag} \
+#hyperrealism #uncannyvalley #clinicalsurrealism #audiovisualart
 """.strip()
     return report
 
@@ -894,6 +909,7 @@ def main():
     if "output_path" not in st.session_state:
         st.session_state.output_path = None
         st.session_state.report_text = None
+        st.session_state.render_count = 0
 
     image_file = st.file_uploader(
         "Foto / Photo (jpg, png) — un volto ben visibile / a clearly visible face",
@@ -1015,14 +1031,16 @@ def main():
         render_clicked = st.button("Genera / Render", type="primary", key="button_render")
     with col_render2:
         preview_clicked = st.button(
-            "Anteprima rapida 3s / Quick 3s preview", key="button_preview",
-            help="Render veloce a bassa risoluzione per testare le impostazioni "
-                 "senza consumare troppa CPU. / Fast low-res render to test "
-                 "settings without using too much CPU.",
+            "Anteprima 5s alta risoluzione / 5s high-res preview", key="button_preview",
+            help="Render breve (max 5s) ma alla risoluzione piena scelta sopra, "
+                 "per vedere la qualita' reale prima del render completo. Costa "
+                 "piu' CPU di un'anteprima a bassa risoluzione. / Short render "
+                 "(max 5s) at the full chosen resolution, to check real quality "
+                 "before the full render. Uses more CPU than a low-res preview.",
         )
 
     def do_render(render_w, render_h, render_duration, output_key, report_key,
-                   progress_label_prefix=""):
+                   progress_label_prefix="", is_official=True):
         if image_file is None:
             st.error("Carica una foto prima di procedere. / Upload a photo first.")
             return
@@ -1140,12 +1158,17 @@ def main():
             with open(final_path, "rb") as src, open(output_bytes_path, "wb") as dst:
                 dst.write(src.read())
 
+            if is_official:
+                st.session_state.render_count += 1
+            vol_number = st.session_state.render_count if is_official else 0
+
             st.session_state[output_key] = output_bytes_path
             st.session_state[report_key] = build_report(
                 style_key, int(seed), render_duration, fps,
                 f"{render_w}x{render_h}",
                 audio_path is not None, bpm_value,
                 f"{w_bass:.1f} / {w_mid:.1f} / {w_high:.1f}",
+                vol_number,
             )
 
             progress.progress(100, text=progress_label_prefix + "Completato / Done")
@@ -1154,29 +1177,42 @@ def main():
         do_render(target_w, target_h, duration_sec, "output_path", "report_text")
 
     if preview_clicked:
-        # anteprima sempre piccola e breve, indipendentemente dalle impostazioni
-        # principali, per un test rapido che non consumi troppa CPU
-        preview_ratio = target_w / target_h
-        if preview_ratio >= 1:
-            preview_w, preview_h = 320, max(int(320 / preview_ratio), 32)
-        else:
-            preview_h, preview_w = 320, max(int(320 * preview_ratio), 32)
-        do_render(preview_w, preview_h, min(duration_sec, 3), "preview_output_path",
-                  "preview_report_text", progress_label_prefix="[Anteprima] ")
+        # anteprima breve (5s) ma alla risoluzione PIENA scelta sopra, cosi'
+        # si vede davvero come verra' il render finale, non una versione
+        # rimpicciolita. Costa piu' CPU di prima, ma e' quello che hai chiesto.
+        do_render(target_w, target_h, min(duration_sec, 5), "preview_output_path",
+                  "preview_report_text", progress_label_prefix="[Anteprima] ",
+                  is_official=False)
 
     if st.session_state.get("preview_output_path") and os.path.exists(
             st.session_state["preview_output_path"]):
-        st.caption("Anteprima rapida / Quick preview")
+        st.caption("Anteprima 5s alta risoluzione / 5s high-res preview")
         st.video(st.session_state["preview_output_path"])
 
     if st.session_state.output_path and os.path.exists(st.session_state.output_path):
         st.video(st.session_state.output_path)
-        with open(st.session_state.output_path, "rb") as fh:
+
+        # Due download indipendenti: cliccare uno dei due NON fa sparire
+        # l'altro (entrambi leggono solo da session_state, che viene svuotato
+        # esclusivamente all'avvio di un nuovo render, mai da un click di
+        # download) - puoi scaricare video e report in qualsiasi ordine.
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            with open(st.session_state.output_path, "rb") as fh:
+                st.download_button(
+                    "Scarica video / Download video", data=fh.read(),
+                    file_name=f"bodyerror_vol{st.session_state.render_count:03d}.mp4",
+                    mime="video/mp4", key="button_download_video",
+                )
+        with col_dl2:
             st.download_button(
-                "Scarica video / Download video", data=fh.read(),
-                file_name="bodyerror_output.mp4", mime="video/mp4", key="button_download",
+                "Scarica report / Download report",
+                data=st.session_state.report_text,
+                file_name=f"bodyerror_report_vol{st.session_state.render_count:03d}.txt",
+                mime="text/plain", key="button_download_report",
             )
-        st.text_area("Report", st.session_state.report_text, height=240, key="area_report")
+
+        st.text_area("Report", st.session_state.report_text, height=280, key="area_report")
 
 
 if __name__ == "__main__":
