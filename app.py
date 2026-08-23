@@ -399,7 +399,7 @@ def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng):
 
     eye_l_center = pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0)
     for i in LANDMARK_GROUPS["eye_l"]:
-        base = pts[i] - (pts[i] - eye_l_center) * (0.35 * eye_i)
+        base = pts[i] + (pts[i] - eye_l_center) * (0.9 * eye_i)
         displaced[i] = base + rng.uniform(-1, 1, 2) * eye_jitter * 7.0
 
     mouth_center = pts[LANDMARK_GROUPS["mouth"]].mean(axis=0)
@@ -428,10 +428,51 @@ def mid_gate(x, center=0.5, sharpness=12.0):
     return float(1.0 / (1.0 + np.exp(-sharpness * (x - center))))
 
 
+def apply_bulge_roi(img, center, radius, amount):
+    """Dilatazione/contrazione radiale (formula classica bulge/pinch, la
+    stessa usata dai filtri "spherize" di Photoshop/Snapchat), applicata solo
+    nel riquadro locale attorno al centro per velocita'. amount>0 = dilata
+    (bulge), amount<0 = contrae (pinch)."""
+    if radius <= 1 or abs(amount) < 1e-4:
+        return img
+    h, w = img.shape[:2]
+    cx, cy = center
+    x0, x1 = int(max(cx - radius, 0)), int(min(cx + radius, w))
+    y0, y1 = int(max(cy - radius, 0)), int(min(cy + radius, h))
+    if x1 <= x0 or y1 <= y0:
+        return img
+
+    sub = img[y0:y1, x0:x1]
+    sh, sw = sub.shape[:2]
+    local_cx, local_cy = cx - x0, cy - y0
+
+    xx, yy = np.meshgrid(np.arange(sw).astype(np.float32), np.arange(sh).astype(np.float32))
+    dx = xx - local_cx
+    dy = yy - local_cy
+    dist = dx * dx + dy * dy
+    mask = dist < (radius * radius)
+
+    d = np.sqrt(np.where(mask, dist, 0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        factor = np.power(np.sin(np.pi * d / radius / 2 + 1e-6), -amount)
+    factor = np.nan_to_num(factor, nan=1.0, posinf=1.0, neginf=1.0)
+    factor = np.where(mask, factor, 1.0)
+
+    map_x = np.clip(factor * dx + local_cx, 0, sw - 1).astype(np.float32)
+    map_y = np.clip(factor * dy + local_cy, 0, sh - 1).astype(np.float32)
+    warped_sub = cv2.remap(sub, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_REFLECT)
+
+    out = img.copy()
+    out[y0:y1, x0:x1] = warped_sub
+    return out
+
+
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
                             seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
                             writer):
-    """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark.
+    """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark,
+    piu' una vera dilatazione radiale (bulge) su occhi e viso intero.
     Le tre bande hanno un carattere qualitativamente diverso, non solo
     un'intensita' diversa: bassi = colpo secco sulla mascella, medi = bocca
     che scatta aperta/chiusa a soglia, alti = tremore rapido sugli occhi."""
@@ -439,6 +480,14 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
     all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
     h, w = base_img.shape[:2]
     triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+
+    eye_r_center = tuple(pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0))
+    eye_l_center = tuple(pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0))
+    eye_width = float(np.linalg.norm(pts[36] - pts[39]))
+    eye_radius = max(eye_width * 2.2, 15.0)
+
+    face_center = tuple(pts.mean(axis=0))
+    face_radius = max(float(np.ptp(pts[:, 0])) * 0.8, 30.0)
 
     total_frames = len(env_bass)
     growth_acc = 0.0
@@ -464,6 +513,17 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
 
         displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng)
         frame = warp_face_mesh(base_img, all_src_pts, displaced, hull_expanded, triangles_idx)
+
+        # dilatazione radiale vera (bulge), non solo spostamento di landmark:
+        # occhi simmetrici pilotati dagli alti, viso intero che si gonfia
+        # progressivamente pilotato dalla crescita permanente + bassi
+        eye_bulge = float(np.clip(eye_i * 0.6, -1.0, 1.0))
+        frame = apply_bulge_roi(frame, eye_r_center, eye_radius, eye_bulge)
+        frame = apply_bulge_roi(frame, eye_l_center, eye_radius, eye_bulge)
+
+        face_bulge = float(np.clip(permanent * 0.7 + eb * 0.3, -1.0, 1.0))
+        frame = apply_bulge_roi(frame, face_center, face_radius, face_bulge)
+
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         writer.write(frame_u8)
