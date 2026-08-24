@@ -428,12 +428,12 @@ def mid_gate(x, center=0.5, sharpness=12.0):
     return float(1.0 / (1.0 + np.exp(-sharpness * (x - center))))
 
 
-def apply_bulge_roi(img, center, radius, amount):
-    """Dilatazione/contrazione radiale (formula classica bulge/pinch, la
-    stessa usata dai filtri "spherize" di Photoshop/Snapchat), applicata solo
-    nel riquadro locale attorno al centro per velocita'. amount>0 = dilata
-    (bulge), amount<0 = contrae (pinch)."""
-    if radius <= 1 or abs(amount) < 1e-4:
+def apply_bulge_roi(img, center, radius, strength):
+    """Lente di ingrandimento radiale: strength>0 campiona un'area piu'
+    piccola vicino al centro (la feature sembra piu' grande, es. occhio che
+    si dilata); strength<0 fa l'opposto (si rimpicciolisce/risucchia).
+    Applicata solo nel riquadro locale attorno al centro per velocita'."""
+    if radius <= 1 or abs(strength) < 1e-4:
         return img
     h, w = img.shape[:2]
     cx, cy = center
@@ -449,17 +449,19 @@ def apply_bulge_roi(img, center, radius, amount):
     xx, yy = np.meshgrid(np.arange(sw).astype(np.float32), np.arange(sh).astype(np.float32))
     dx = xx - local_cx
     dy = yy - local_cy
-    dist = dx * dx + dy * dy
-    mask = dist < (radius * radius)
+    d = np.sqrt(dx * dx + dy * dy)
+    norm = np.clip(d / radius, 0, 1)
 
-    d = np.sqrt(np.where(mask, dist, 0))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        factor = np.power(np.sin(np.pi * d / radius / 2 + 1e-6), -amount)
-    factor = np.nan_to_num(factor, nan=1.0, posinf=1.0, neginf=1.0)
-    factor = np.where(mask, factor, 1.0)
+    factor = 1.0 - strength * (1.0 - norm) ** 2
+    factor = np.where(d < radius, factor, 1.0)
+    d_safe = np.where(d < 1e-6, 1.0, d)
+    new_d = factor * d
 
-    map_x = np.clip(factor * dx + local_cx, 0, sw - 1).astype(np.float32)
-    map_y = np.clip(factor * dy + local_cy, 0, sh - 1).astype(np.float32)
+    map_x = np.where(d < 1e-6, local_cx, local_cx + (dx / d_safe) * new_d)
+    map_y = np.where(d < 1e-6, local_cy, local_cy + (dy / d_safe) * new_d)
+    map_x = np.clip(map_x, 0, sw - 1).astype(np.float32)
+    map_y = np.clip(map_y, 0, sh - 1).astype(np.float32)
+
     warped_sub = cv2.remap(sub, map_x, map_y, interpolation=cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_REFLECT)
 
@@ -484,7 +486,7 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
     eye_r_center = tuple(pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0))
     eye_l_center = tuple(pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0))
     eye_width = float(np.linalg.norm(pts[36] - pts[39]))
-    eye_radius = max(eye_width * 2.2, 15.0)
+    eye_radius = max(eye_width * 1.6, 12.0)
 
     face_center = tuple(pts.mean(axis=0))
     face_radius = max(float(np.ptp(pts[:, 0])) * 0.8, 30.0)
@@ -514,14 +516,14 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng)
         frame = warp_face_mesh(base_img, all_src_pts, displaced, hull_expanded, triangles_idx)
 
-        # dilatazione radiale vera (bulge), non solo spostamento di landmark:
-        # occhi simmetrici pilotati dagli alti, viso intero che si gonfia
-        # progressivamente pilotato dalla crescita permanente + bassi
-        eye_bulge = float(np.clip(eye_i * 0.6, -1.0, 1.0))
+        # dilatazione radiale vera (lente d'ingrandimento), non solo
+        # spostamento di landmark: occhi simmetrici pilotati dagli alti,
+        # viso intero che si gonfia pilotato dalla crescita permanente + bassi
+        eye_bulge = float(np.clip(0.25 + eye_i * 0.9, 0.0, 0.9))
         frame = apply_bulge_roi(frame, eye_r_center, eye_radius, eye_bulge)
         frame = apply_bulge_roi(frame, eye_l_center, eye_radius, eye_bulge)
 
-        face_bulge = float(np.clip(permanent * 0.7 + eb * 0.3, -1.0, 1.0))
+        face_bulge = float(np.clip(permanent * 0.7 + eb * 0.3, -0.9, 0.9))
         frame = apply_bulge_roi(frame, face_center, face_radius, face_bulge)
 
         frame = clinical_grade(frame)
