@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import soundfile as sf
 import streamlit as st
+from scipy.signal import find_peaks
 from scipy.spatial import cKDTree
 
 try:
@@ -267,6 +268,46 @@ def analyze_audio_bands(path, target_fps, duration_sec):
     return env_bass, env_mid, env_high, beat_video_frames, bpm_value
 
 
+MAJOR_KEY_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+MAJOR_KEY_PROFILE = MAJOR_KEY_PROFILE / MAJOR_KEY_PROFILE.sum()
+MINOR_KEY_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+MINOR_KEY_PROFILE = MINOR_KEY_PROFILE / MINOR_KEY_PROFILE.sum()
+
+
+def analyze_audio_character(path, duration_sec):
+    """Estrae due descrittori GLOBALI del brano (una volta sola, non per
+    frame), usati per cambiare il "carattere" della deformazione da brano a
+    brano:
+    - mode_score: -1 (tonalita' minore) .. +1 (tonalita' maggiore), via
+      correlazione del chroma medio contro i profili di Krumhansl-Kessler
+    - complexity_score: 0..1, numero di picchi distinti nello spettro medio
+      (proxy del numero di "voci"/strumenti simultanei nel mix - un accordo
+      denso o un mix con molti strumenti produce piu' picchi spettrali di
+      una linea di basso e una batteria sole)
+    """
+    y, sr = librosa.load(path, sr=22050, mono=True, duration=duration_sec)
+
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    mean_chroma = chroma.mean(axis=1)
+    mean_chroma = mean_chroma / (mean_chroma.sum() + 1e-9)
+
+    best_major, best_minor = -2.0, -2.0
+    for shift in range(12):
+        corr_maj = np.corrcoef(mean_chroma, np.roll(MAJOR_KEY_PROFILE, shift))[0, 1]
+        corr_min = np.corrcoef(mean_chroma, np.roll(MINOR_KEY_PROFILE, shift))[0, 1]
+        best_major = max(best_major, corr_maj)
+        best_minor = max(best_minor, corr_min)
+    mode_score = float(np.clip(best_major - best_minor, -1.0, 1.0))
+
+    stft = np.abs(librosa.stft(y, n_fft=2048))
+    mean_spec = stft.mean(axis=1)
+    mean_spec_db = librosa.amplitude_to_db(mean_spec, ref=max(mean_spec.max(), 1e-9))
+    peaks, _ = find_peaks(mean_spec_db, height=-30, distance=5)
+    complexity_score = float(np.clip(len(peaks) / 30.0, 0.0, 1.0))
+
+    return mode_score, complexity_score
+
+
 def synthetic_bands(target_fps, duration_sec):
     """Fallback senza audio: tre curve ADSR leggermente sfasate tra loro."""
     total_frames = int(duration_sec * target_fps)
@@ -470,11 +511,56 @@ def apply_bulge_roi(img, center, radius, strength):
     return out
 
 
+def apply_directional_stretch(img, center, radius, stretch_x, stretch_y):
+    """Allungamento/allargamento anisotropo (assi x/y indipendenti) attorno
+    a un centro, con dissolvenza verso il bordo del raggio - stessa
+    struttura di apply_bulge_roi ma senza vincolo di simmetria radiale,
+    per un volto che si allunga in verticale o si allarga in orizzontale
+    invece di gonfiarsi in modo uniforme in tutte le direzioni."""
+    if radius <= 1 or (abs(stretch_x) < 1e-4 and abs(stretch_y) < 1e-4):
+        return img
+    h, w = img.shape[:2]
+    cx, cy = center
+    x0, x1 = int(max(cx - radius, 0)), int(min(cx + radius, w))
+    y0, y1 = int(max(cy - radius, 0)), int(min(cy + radius, h))
+    if x1 <= x0 or y1 <= y0:
+        return img
+
+    sub = img[y0:y1, x0:x1]
+    sh, sw = sub.shape[:2]
+    local_cx, local_cy = cx - x0, cy - y0
+
+    xx, yy = np.meshgrid(np.arange(sw).astype(np.float32), np.arange(sh).astype(np.float32))
+    dx = xx - local_cx
+    dy = yy - local_cy
+    d = np.sqrt(dx * dx + dy * dy) + 1e-6
+    norm = np.clip(d / radius, 0, 1)
+    fall = (1.0 - norm) ** 2
+
+    fx = 1.0 - float(np.clip(stretch_x, -0.9, 0.9)) * fall
+    fy = 1.0 - float(np.clip(stretch_y, -0.9, 0.9)) * fall
+
+    map_x = np.clip(local_cx + dx * fx, 0, sw - 1).astype(np.float32)
+    map_y = np.clip(local_cy + dy * fy, 0, sh - 1).astype(np.float32)
+    warped_sub = cv2.remap(sub, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_REFLECT)
+
+    out = img.copy()
+    out[y0:y1, x0:x1] = warped_sub
+    return out
+
+
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
                             seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
-                            writer):
+                            writer, mode_score=0.0, complexity_score=0.5):
     """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark,
-    piu' una vera dilatazione radiale (bulge) su occhi e viso intero.
+    piu' dilatazione radiale (bulge) su occhi e viso intero e uno stretch
+    direzionale legato al carattere del brano:
+    - mode_score (-1 minore .. +1 maggiore): minore = il viso si allunga in
+      verticale (droop/melt), maggiore = si allarga in orizzontale (swell)
+    - complexity_score (0..1, densita' spettrale/n. voci nel mix): scala il
+      caos/asimmetria e il tremore, cosi' brani densi risultano visibilmente
+      piu' frammentati di brani minimali
     Le tre bande hanno un carattere qualitativamente diverso, non solo
     un'intensita' diversa: bassi = colpo secco sulla mascella, medi = bocca
     che scatta aperta/chiusa a soglia, alti = tremore rapido sugli occhi."""
@@ -490,6 +576,11 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
 
     face_center = tuple(pts.mean(axis=0))
     face_radius = max(float(np.ptp(pts[:, 0])) * 0.8, 30.0)
+    stretch_radius = max(float(np.ptp(pts[:, 0])) * 1.7, 60.0)
+
+    # asimmetria fissa per questo render (seedata), tanto piu' marcata quanto
+    # piu' il brano e' denso/complesso - rende ogni lato leggermente diverso
+    asym_l, asym_r = 1.0 + rng.uniform(-0.3, 0.3, 2) * complexity_score
 
     total_frames = len(env_bass)
     growth_acc = 0.0
@@ -509,11 +600,18 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         # medi: la bocca scatta aperta a soglia, non scala in modo lineare
         mouth_i = permanent * 0.4 + w_mid * base_intensity * mid_gate(em)
 
-        # alti: componente liscia ridotta + tremore ad alta frequenza vero
+        # alti: componente liscia ridotta + tremore ad alta frequenza vero,
+        # amplificato dalla complessita' spettrale del brano
         eye_i = permanent * 0.3 + eh_ * w_high * base_intensity * 0.4
-        eye_jitter = eh_ * w_high
+        eye_jitter = eh_ * w_high * (0.6 + complexity_score * 0.8)
 
         displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng)
+        # leggera asimmetria sinistra/destra sulla mascella, seedata per brano
+        for i in LANDMARK_GROUPS["jaw"][:9]:
+            displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_l
+        for i in LANDMARK_GROUPS["jaw"][9:]:
+            displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_r
+
         frame = warp_face_mesh(base_img, all_src_pts, displaced, hull_expanded, triangles_idx)
 
         # dilatazione radiale vera (lente d'ingrandimento), non solo
@@ -525,6 +623,17 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
 
         face_bulge = float(np.clip(permanent * 0.7 + eb * 0.3, -0.9, 0.9))
         frame = apply_bulge_roi(frame, face_center, face_radius, face_bulge)
+
+        # stretch direzionale: la tonalita' del brano decide se il viso si
+        # allunga (minore, malinconico/orrido) o si allarga (maggiore,
+        # gonfio/aggressivo) - cresce nel tempo con la progressione permanente
+        stretch_amount = permanent * 0.8
+        if mode_score < 0:
+            frame = apply_directional_stretch(frame, face_center, stretch_radius,
+                                               0.0, stretch_amount * (1.0 + abs(mode_score)))
+        else:
+            frame = apply_directional_stretch(frame, face_center, stretch_radius,
+                                               stretch_amount * (1.0 + mode_score), 0.0)
 
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
@@ -1137,9 +1246,11 @@ def main():
             progress = st.progress(0, text=progress_label_prefix + "Analisi audio / Audio analysis...")
 
             bpm_value = None
+            mode_score, complexity_score = 0.0, 0.5
             if audio_path is not None and LIBROSA_OK:
                 env_bass, env_mid, env_high, beat_frames, bpm_value = analyze_audio_bands(
                     audio_path, fps, render_duration)
+                mode_score, complexity_score = analyze_audio_character(audio_path, render_duration)
             else:
                 if audio_path is not None and not LIBROSA_OK:
                     st.warning("librosa non disponibile: uso envelope sintetico. / "
@@ -1186,6 +1297,7 @@ def main():
                         base_intensity=float(aw_intensity), w_bass=float(w_bass),
                         w_mid=float(w_mid), w_high=float(w_high),
                         growth_rate=float(aw_growth), writer=writer,
+                        mode_score=mode_score, complexity_score=complexity_score,
                     )
                 elif style_key == STYLE_VORONOI:
                     render_voronoi(
