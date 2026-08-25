@@ -570,7 +570,8 @@ def apply_directional_stretch(img, center, radius, stretch_x, stretch_y):
 
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
                             seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
-                            writer, mode_score=0.0, complexity_score=0.5):
+                            writer, mode_score=0.0, complexity_score=0.5,
+                            smile_override=None):
     """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark,
     piu' dilatazione radiale (bulge) su occhi e viso intero e uno stretch
     direzionale legato al carattere del brano:
@@ -579,6 +580,8 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
     - complexity_score (0..1, densita' spettrale/n. voci nel mix): scala il
       caos/asimmetria e il tremore, cosi' brani densi risultano visibilmente
       piu' frammentati di brani minimali
+    - smile_override: se non None (da -1 a 1), sovrascrive il rilevamento
+      automatico del sorriso dalla foto (ghigno se positivo, urlo se negativo)
     Le tre bande hanno un carattere qualitativamente diverso, non solo
     un'intensita' diversa: bassi = colpo secco sulla mascella, medi = bocca
     che scatta aperta/chiusa a soglia, alti = tremore rapido sugli occhi."""
@@ -599,7 +602,7 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
     # asimmetria fissa per questo render (seedata), tanto piu' marcata quanto
     # piu' il brano e' denso/complesso - rende ogni lato leggermente diverso
     asym_l, asym_r = 1.0 + rng.uniform(-0.3, 0.3, 2) * complexity_score
-    smile_bias = compute_smile_score(pts)
+    smile_bias = compute_smile_score(pts) if smile_override is None else float(smile_override)
 
     total_frames = len(env_bass)
     growth_acc = 0.0
@@ -1172,6 +1175,18 @@ def main():
                                   key="aw_intensity")
         aw_growth = st.slider("Velocita' progressione permanente / Permanent growth rate",
                                0.5, 5.0, 2.0, 0.5, key="aw_growth")
+        aw_auto_smile = st.checkbox(
+            "Rileva ghigno/urlo automaticamente dalla foto / "
+            "Auto-detect grin/scream from photo", value=True, key="aw_auto_smile",
+            help="Se disattivato, usa lo slider sotto invece di leggere "
+                 "l'espressione dalla foto caricata. / If off, uses the "
+                 "slider below instead of reading the expression from the "
+                 "uploaded photo.",
+        )
+        aw_smile_manual = st.slider(
+            "Forza urlo (-1) / ghigno (+1) / Force scream (-1) / grin (+1)",
+            -1.0, 1.0, 0.0, 0.1, key="aw_smile_manual", disabled=aw_auto_smile,
+        )
     with st.expander("Voronoi Fracture",
                       expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
         if style_key == STYLE_COMBO:
@@ -1345,6 +1360,7 @@ def main():
                         w_mid=float(w_mid), w_high=float(w_high),
                         growth_rate=float(aw_growth), writer=writer,
                         mode_score=mode_score, complexity_score=complexity_score,
+                        smile_override=None if aw_auto_smile else float(aw_smile_manual),
                     )
                 elif style_key == STYLE_VORONOI:
                     render_voronoi(
