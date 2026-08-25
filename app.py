@@ -427,10 +427,26 @@ def warp_face_mesh(base_img, all_src_pts, displaced_landmarks, hull_expanded, tr
     return output
 
 
-def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng):
+def compute_smile_score(pts):
+    """Curvatura della bocca nella foto ORIGINALE (dai landmark, non da Haar
+    Cascade - piu' preciso): positivo se sorride, vicino a zero/negativo se
+    neutra o accigliata. Usata per decidere se esagerare il sorriso in un
+    ghigno horror o forzare la bocca in un urlo."""
+    left_corner, right_corner = pts[48], pts[54]
+    top_lip, bottom_lip = pts[51], pts[57]
+    mouth_width = float(np.linalg.norm(right_corner - left_corner)) + 1e-6
+    corner_avg_y = (left_corner[1] + right_corner[1]) / 2.0
+    center_y = (top_lip[1] + bottom_lip[1]) / 2.0
+    lift = center_y - corner_avg_y
+    return float(np.clip(lift / mouth_width * 3.0, -1.0, 1.0))
+
+
+def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng, smile_bias=0.0):
     """Sposta i landmark per gruppo. eye_jitter aggiunge un tremore casuale
     ad alta frequenza (ricalcolato ogni frame) sugli occhi, per un carattere
-    "nervoso" distinto dalla crescita liscia degli altri gruppi."""
+    "nervoso" distinto dalla crescita liscia degli altri gruppi. smile_bias
+    (da compute_smile_score) esagera il sorriso originale in un ghigno se
+    positivo, o forza la bocca in un urlo verticale se neutro/negativo."""
     displaced = pts.copy()
 
     eye_r_center = pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0)
@@ -443,10 +459,12 @@ def build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng):
         base = pts[i] + (pts[i] - eye_l_center) * (0.9 * eye_i)
         displaced[i] = base + rng.uniform(-1, 1, 2) * eye_jitter * 7.0
 
+    smile_pos = max(smile_bias, 0.0)
+    smile_neg = max(-smile_bias, 0.0)
     mouth_center = pts[LANDMARK_GROUPS["mouth"]].mean(axis=0)
     for i in LANDMARK_GROUPS["mouth"]:
-        dx = (pts[i][0] - mouth_center[0]) * (1.1 * mouth_i)
-        dy = 16.0 * mouth_i
+        dx = (pts[i][0] - mouth_center[0]) * (1.1 * mouth_i) * (1.0 + smile_pos * 0.9)
+        dy = 16.0 * mouth_i * (1.0 - smile_pos * 0.3) + smile_neg * mouth_i * 12.0
         displaced[i] = pts[i] + np.array([dx, dy])
 
     jaw_center_x = pts[LANDMARK_GROUPS["jaw"]][:, 0].mean()
@@ -581,6 +599,7 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
     # asimmetria fissa per questo render (seedata), tanto piu' marcata quanto
     # piu' il brano e' denso/complesso - rende ogni lato leggermente diverso
     asym_l, asym_r = 1.0 + rng.uniform(-0.3, 0.3, 2) * complexity_score
+    smile_bias = compute_smile_score(pts)
 
     total_frames = len(env_bass)
     growth_acc = 0.0
@@ -605,7 +624,8 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         eye_i = permanent * 0.3 + eh_ * w_high * base_intensity * 0.4
         eye_jitter = eh_ * w_high * (0.6 + complexity_score * 0.8)
 
-        displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng)
+        displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter, rng,
+                                                smile_bias=smile_bias)
         # leggera asimmetria sinistra/destra sulla mascella, seedata per brano
         for i in LANDMARK_GROUPS["jaw"][:9]:
             displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_l
@@ -680,25 +700,33 @@ def compute_voronoi_cells(img, region_mask, n_points, rng):
     return points, labels
 
 
-def apply_voronoi_displacement(img, points, labels, intensity, rng):
+def apply_voronoi_displacement(img, points, labels, intensity, rng, mode_score=0.0,
+                                complexity_score=0.5):
     """Parte economica (solo spostamento delle celle gia' segmentate): questa
-    si ricalcola ad ogni frame perche' l'intensita' cambia con l'audio."""
+    si ricalcola ad ogni frame perche' l'intensita' cambia con l'audio.
+    mode_score: minore = i pezzi cadono di piu' (droop), maggiore = si
+    spingono di piu' verso l'esterno (radiale/esplosivo). complexity_score
+    scala il rumore casuale per pezzo, per un caos maggiore su brani densi."""
     h, w = img.shape[:2]
     n_cells = len(points)
     cx = points[:, 0].mean()
     cy = points[:, 1].mean()
+
+    fall_bias = 0.7 + max(-mode_score, 0.0) * 0.6
+    radial_bias = 1.2 + max(mode_score, 0.0) * 0.7
+    jitter_scale = 0.5 + complexity_score
 
     disp_x = np.zeros(n_cells, dtype=np.float32)
     disp_y = np.zeros(n_cells, dtype=np.float32)
     for i, (px, py) in enumerate(points):
         dx, dy = px - cx, py - cy
         dist = np.sqrt(dx * dx + dy * dy) + 1e-6
-        push = (dist / max(w, h)) * 1.2
+        push = (dist / max(w, h)) * radial_bias
         disp_x[i] = (dx / dist) * push * intensity * 45
-        disp_y[i] = (dy / dist) * push * intensity * 45 + 0.7 * intensity * 30
+        disp_y[i] = (dy / dist) * push * intensity * 45 + fall_bias * intensity * 30
 
-    disp_x += rng.uniform(-6, 6, n_cells) * intensity
-    disp_y += rng.uniform(-3, 10, n_cells) * intensity
+    disp_x += rng.uniform(-6, 6, n_cells) * intensity * jitter_scale
+    disp_y += rng.uniform(-3, 10, n_cells) * intensity * jitter_scale
 
     # base "tessuto sotto la crepa": la foto stessa leggermente ammorbidita,
     # NON annerita - cosi' dove una placca si sposta si vede ancora il volto
@@ -744,7 +772,8 @@ def apply_voronoi_displacement(img, points, labels, intensity, rng):
 
 
 def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
-                    seed, base_intensity, n_points, growth_rate, writer):
+                    seed, base_intensity, n_points, growth_rate, writer,
+                    mode_score=0.0, complexity_score=0.5):
     """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM).
     I punti/celle Voronoi si ricalcolano solo ai beat (costoso), non ogni
     frame (economico): stesso identico risultato visivo, molto meno CPU."""
@@ -771,7 +800,9 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             intensity *= 1.7
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
-        frame = apply_voronoi_displacement(base_img, points, labels, intensity, disp_rng)
+        frame = apply_voronoi_displacement(base_img, points, labels, intensity, disp_rng,
+                                            mode_score=mode_score,
+                                            complexity_score=complexity_score)
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         writer.write(frame_u8)
@@ -782,8 +813,12 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
 # ---------------------------------------------------------------------------
 
 def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_high,
-                            beat_frames, seed, base_intensity, writer, n_walkers=40):
-    """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM)."""
+                            beat_frames, seed, base_intensity, writer, n_walkers=40,
+                            mode_score=0.0, complexity_score=0.5):
+    """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM).
+    mode_score: minore = le venature derivano verso il basso (sanguinamento),
+    maggiore = si diramano piu' verso l'esterno. complexity_score scala la
+    frequenza di ramificazione, per venature piu' fitte su brani densi."""
     rng = np.random.default_rng(seed)
     h, w = base_img.shape[:2]
 
@@ -816,6 +851,11 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
     vein_mask = np.zeros((h, w), dtype=np.float32)
     bleed_color = np.array([0.05, 0.02, 0.35], dtype=np.float32)  # BGR rosso scuro
 
+    # deriva costante legata alla tonalita': minore = venature che colano
+    # verso il basso, maggiore = si diramano piu' verso l'esterno
+    drift = np.array([0.0, max(-mode_score, 0.0) * 0.5], dtype=np.float32)
+    outward_bias = max(mode_score, 0.0) * 0.4
+
     total_frames = len(env_bass)
     max_walkers = n_walkers * 5
 
@@ -829,8 +869,9 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
         tangent_x = -gy_n[yi, xi]
         tangent_y = gx_n[yi, xi]
         rand_perturb = rng.uniform(-0.4, 0.4, walker_dir.shape).astype(np.float32)
+        outward = (walker_pos - np.array([w / 2, h / 2])) * outward_bias / max(w, h)
         walker_dir = (0.7 * walker_dir + 0.3 * np.stack([tangent_x, tangent_y], axis=1)
-                      + rand_perturb)
+                      + rand_perturb + drift + outward)
         norm = np.linalg.norm(walker_dir, axis=1, keepdims=True) + 1e-6
         walker_dir = walker_dir / norm
 
@@ -842,10 +883,11 @@ def render_capillary_bleed(base_img, region_mask, pts, env_bass, env_mid, env_hi
         yi2 = walker_pos[:, 1].astype(int)
         vein_mask[yi2, xi2] = 1.0
 
-        # gli ALTI pilotano la frequenza di ramificazione (nuove diramazioni)
-        branch_prob = eh_ * 0.5
+        # gli ALTI pilotano la frequenza di ramificazione, amplificata dalla
+        # complessita' spettrale (brani densi = venature piu' fitte)
+        branch_prob = eh_ * 0.5 * (0.6 + complexity_score)
         if (f in beat_frames or rng.uniform(0, 1) < branch_prob) and len(walker_pos) < max_walkers:
-            n_new = min(4, n_walkers)
+            n_new = min(int(4 * (0.6 + complexity_score)), n_walkers)
             branch_idx = rng.integers(0, len(walker_pos), n_new)
             new_pos = walker_pos[branch_idx] + rng.uniform(-2, 2, (n_new, 2))
             new_pos[:, 0] = np.clip(new_pos[:, 0], 0, w - 1)
@@ -885,7 +927,7 @@ def crack_seeds_from_labels(labels, n_seeds, rng, w, h):
 
 def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env_high,
                                     beat_frames, seed, base_intensity, n_points,
-                                    growth_rate, writer):
+                                    growth_rate, writer, mode_score=0.0, complexity_score=0.5):
     h, w = base_img.shape[:2]
     total_frames = len(env_bass)
     growth_acc = 0.0
@@ -910,6 +952,8 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
     gy_n = gy_img / mag
 
     max_walkers = n_walkers * 4
+    drift = np.array([0.0, max(-mode_score, 0.0) * 0.5], dtype=np.float32)
+    outward_bias = max(mode_score, 0.0) * 0.4
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -930,7 +974,9 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
             frac_intensity *= 1.6
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
-        fractured = apply_voronoi_displacement(base_img, points, labels, frac_intensity, disp_rng)
+        fractured = apply_voronoi_displacement(base_img, points, labels, frac_intensity, disp_rng,
+                                                mode_score=mode_score,
+                                                complexity_score=complexity_score)
 
         step_size = 1.0 + 2.5 * em
         xi = np.clip(walker_pos[:, 0].astype(int), 0, w - 1)
@@ -938,8 +984,9 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
         tangent_x = -gy_n[yi, xi]
         tangent_y = gx_n[yi, xi]
         rand_perturb = rng.uniform(-0.4, 0.4, walker_dir.shape).astype(np.float32)
+        outward = (walker_pos - np.array([w / 2, h / 2])) * outward_bias / max(w, h)
         walker_dir = (0.7 * walker_dir + 0.3 * np.stack([tangent_x, tangent_y], axis=1)
-                      + rand_perturb)
+                      + rand_perturb + drift + outward)
         norm = np.linalg.norm(walker_dir, axis=1, keepdims=True) + 1e-6
         walker_dir = walker_dir / norm
         walker_pos = walker_pos + walker_dir * step_size
@@ -949,9 +996,9 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
         yi2 = walker_pos[:, 1].astype(int)
         vein_mask[yi2, xi2] = 1.0
 
-        branch_prob = eh_ * 0.4
+        branch_prob = eh_ * 0.4 * (0.6 + complexity_score)
         if (f in beat_frames or rng.uniform(0, 1) < branch_prob) and len(walker_pos) < max_walkers:
-            n_new = min(3, n_walkers)
+            n_new = min(int(3 * (0.6 + complexity_score)), n_walkers)
             branch_idx = rng.integers(0, len(walker_pos), n_new)
             new_pos = walker_pos[branch_idx] + rng.uniform(-2, 2, (n_new, 2))
             new_pos[:, 0] = np.clip(new_pos[:, 0], 0, w - 1)
@@ -1304,18 +1351,21 @@ def main():
                         base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
                         int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
                         n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
+                        mode_score=mode_score, complexity_score=complexity_score,
                     )
                 elif style_key == STYLE_CAPILLARY:
                     render_capillary_bleed(
                         base_img, region_mask, pts, env_bass, env_mid, env_high, beat_frames,
                         int(seed), base_intensity=float(cb_intensity), writer=writer,
                         n_walkers=int(cb_walkers),
+                        mode_score=mode_score, complexity_score=complexity_score,
                     )
                 elif style_key == STYLE_COMBO:
                     render_voronoi_capillary_combo(
                         base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
                         int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
                         n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
+                        mode_score=mode_score, complexity_score=complexity_score,
                     )
                 else:
                     st.error("Stile non riconosciuto. / Unrecognized style.")
