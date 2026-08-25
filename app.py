@@ -522,7 +522,7 @@ def apply_bulge_roi(img, center, radius, strength):
     map_y = np.clip(map_y, 0, sh - 1).astype(np.float32)
 
     warped_sub = cv2.remap(sub, map_x, map_y, interpolation=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_REFLECT)
+                            borderMode=cv2.BORDER_REFLECT_101)
 
     out = img.copy()
     out[y0:y1, x0:x1] = warped_sub
@@ -561,7 +561,7 @@ def apply_directional_stretch(img, center, radius, stretch_x, stretch_y):
     map_x = np.clip(local_cx + dx * fx, 0, sw - 1).astype(np.float32)
     map_y = np.clip(local_cy + dy * fy, 0, sh - 1).astype(np.float32)
     warped_sub = cv2.remap(sub, map_x, map_y, interpolation=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_REFLECT)
+                            borderMode=cv2.BORDER_REFLECT_101)
 
     out = img.copy()
     out[y0:y1, x0:x1] = warped_sub
