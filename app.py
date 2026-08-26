@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import soundfile as sf
 import streamlit as st
+from scipy import ndimage
 from scipy.signal import find_peaks
 from scipy.spatial import cKDTree
 
@@ -119,22 +120,35 @@ def build_background_subject_mask(img):
     return mask
 
 
+_VIGNETTE_CACHE = {}
+
+
+def _get_vignette(h, w):
+    """La vignettatura dipende solo dalla risoluzione, mai dal contenuto del
+    frame: ricalcolarla ogni frame (griglia + sqrt su tutta l'immagine) e'
+    puro spreco di CPU. Cache per dimensione."""
+    key = (h, w)
+    if key not in _VIGNETTE_CACHE:
+        yy, xx = np.ogrid[:h, :w]
+        cx, cy = w / 2, h / 2
+        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        max_dist = np.sqrt(cx ** 2 + cy ** 2)
+        vignette = 1 - 0.35 * (dist / max_dist) ** 2
+        vignette = np.clip(vignette, 0.5, 1.0)[..., None]
+        _VIGNETTE_CACHE[key] = vignette.astype(np.float32)
+    return _VIGNETTE_CACHE[key]
+
+
 def clinical_grade(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray3 = np.stack([gray] * 3, axis=-1)
-    img = img * 0.55 + gray3 * 0.45
+    gray3 = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    img = cv2.addWeighted(img, 0.55, gray3, 0.45, 0.0)
     tint = np.array([1.08, 1.03, 0.88], dtype=np.float32)
     img = np.clip(img * tint, 0, 1)
     img = np.clip((img - 0.5) * 1.15 + 0.5, 0, 1)
 
     h, w = img.shape[:2]
-    yy, xx = np.ogrid[:h, :w]
-    cx, cy = w / 2, h / 2
-    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    max_dist = np.sqrt(cx ** 2 + cy ** 2)
-    vignette = 1 - 0.35 * (dist / max_dist) ** 2
-    vignette = np.clip(vignette, 0.5, 1.0)[..., None]
-    img = img * vignette
+    img = img * _get_vignette(h, w)
     return np.clip(img, 0, 1)
 
 
@@ -487,11 +501,14 @@ def mid_gate(x, center=0.5, sharpness=12.0):
     return float(1.0 / (1.0 + np.exp(-sharpness * (x - center))))
 
 
-def apply_bulge_roi(img, center, radius, strength):
+def apply_bulge_roi(img, center, radius, strength, work_scale=0.35):
     """Lente di ingrandimento radiale: strength>0 campiona un'area piu'
     piccola vicino al centro (la feature sembra piu' grande, es. occhio che
     si dilata); strength<0 fa l'opposto (si rimpicciolisce/risucchia).
-    Applicata solo nel riquadro locale attorno al centro per velocita'."""
+    Il campo di deformazione (la parte costosa: meshgrid + sqrt + potenza)
+    viene calcolato a risoluzione ridotta e poi ricampionato alla risoluzione
+    piena del riquadro - stesso identico risultato visivo, molto meno CPU,
+    perche' il remap finale lavora sempre sui pixel a piena qualita'."""
     if radius <= 1 or abs(strength) < 1e-4:
         return img
     h, w = img.shape[:2]
@@ -505,19 +522,27 @@ def apply_bulge_roi(img, center, radius, strength):
     sh, sw = sub.shape[:2]
     local_cx, local_cy = cx - x0, cy - y0
 
-    xx, yy = np.meshgrid(np.arange(sw).astype(np.float32), np.arange(sh).astype(np.float32))
-    dx = xx - local_cx
-    dy = yy - local_cy
+    wsh, wsw = max(int(sh * work_scale), 8), max(int(sw * work_scale), 8)
+    wsx, wsy = sw / wsw, sh / wsh
+    local_cx_s, local_cy_s = local_cx / wsx, local_cy / wsy
+    radius_s = radius / max(wsx, wsy)
+
+    xx, yy = np.meshgrid(np.arange(wsw).astype(np.float32), np.arange(wsh).astype(np.float32))
+    dx = xx - local_cx_s
+    dy = yy - local_cy_s
     d = np.sqrt(dx * dx + dy * dy)
-    norm = np.clip(d / radius, 0, 1)
+    norm = np.clip(d / radius_s, 0, 1)
 
     factor = 1.0 - strength * (1.0 - norm) ** 2
-    factor = np.where(d < radius, factor, 1.0)
+    factor = np.where(d < radius_s, factor, 1.0)
     d_safe = np.where(d < 1e-6, 1.0, d)
     new_d = factor * d
 
-    map_x = np.where(d < 1e-6, local_cx, local_cx + (dx / d_safe) * new_d)
-    map_y = np.where(d < 1e-6, local_cy, local_cy + (dy / d_safe) * new_d)
+    map_x_small = np.where(d < 1e-6, local_cx_s, local_cx_s + (dx / d_safe) * new_d)
+    map_y_small = np.where(d < 1e-6, local_cy_s, local_cy_s + (dy / d_safe) * new_d)
+
+    map_x = cv2.resize(map_x_small, (sw, sh), interpolation=cv2.INTER_LINEAR) * wsx
+    map_y = cv2.resize(map_y_small, (sw, sh), interpolation=cv2.INTER_LINEAR) * wsy
     map_x = np.clip(map_x, 0, sw - 1).astype(np.float32)
     map_y = np.clip(map_y, 0, sh - 1).astype(np.float32)
 
@@ -529,12 +554,13 @@ def apply_bulge_roi(img, center, radius, strength):
     return out
 
 
-def apply_directional_stretch(img, center, radius, stretch_x, stretch_y):
+def apply_directional_stretch(img, center, radius, stretch_x, stretch_y, work_scale=0.35):
     """Allungamento/allargamento anisotropo (assi x/y indipendenti) attorno
     a un centro, con dissolvenza verso il bordo del raggio - stessa
-    struttura di apply_bulge_roi ma senza vincolo di simmetria radiale,
-    per un volto che si allunga in verticale o si allarga in orizzontale
-    invece di gonfiarsi in modo uniforme in tutte le direzioni."""
+    struttura di apply_bulge_roi (campo calcolato a bassa risoluzione e
+    ricampionato) ma senza vincolo di simmetria radiale, per un volto che si
+    allunga in verticale o si allarga in orizzontale invece di gonfiarsi in
+    modo uniforme in tutte le direzioni."""
     if radius <= 1 or (abs(stretch_x) < 1e-4 and abs(stretch_y) < 1e-4):
         return img
     h, w = img.shape[:2]
@@ -548,18 +574,29 @@ def apply_directional_stretch(img, center, radius, stretch_x, stretch_y):
     sh, sw = sub.shape[:2]
     local_cx, local_cy = cx - x0, cy - y0
 
-    xx, yy = np.meshgrid(np.arange(sw).astype(np.float32), np.arange(sh).astype(np.float32))
-    dx = xx - local_cx
-    dy = yy - local_cy
+    wsh, wsw = max(int(sh * work_scale), 8), max(int(sw * work_scale), 8)
+    wsx, wsy = sw / wsw, sh / wsh
+    local_cx_s, local_cy_s = local_cx / wsx, local_cy / wsy
+    radius_s = radius / max(wsx, wsy)
+
+    xx, yy = np.meshgrid(np.arange(wsw).astype(np.float32), np.arange(wsh).astype(np.float32))
+    dx = xx - local_cx_s
+    dy = yy - local_cy_s
     d = np.sqrt(dx * dx + dy * dy) + 1e-6
-    norm = np.clip(d / radius, 0, 1)
+    norm = np.clip(d / radius_s, 0, 1)
     fall = (1.0 - norm) ** 2
 
     fx = 1.0 - float(np.clip(stretch_x, -0.9, 0.9)) * fall
     fy = 1.0 - float(np.clip(stretch_y, -0.9, 0.9)) * fall
 
-    map_x = np.clip(local_cx + dx * fx, 0, sw - 1).astype(np.float32)
-    map_y = np.clip(local_cy + dy * fy, 0, sh - 1).astype(np.float32)
+    map_x_small = local_cx_s + dx * fx
+    map_y_small = local_cy_s + dy * fy
+
+    map_x = cv2.resize(map_x_small, (sw, sh), interpolation=cv2.INTER_LINEAR) * wsx
+    map_y = cv2.resize(map_y_small, (sw, sh), interpolation=cv2.INTER_LINEAR) * wsy
+    map_x = np.clip(map_x, 0, sw - 1).astype(np.float32)
+    map_y = np.clip(map_y, 0, sh - 1).astype(np.float32)
+
     warped_sub = cv2.remap(sub, map_x, map_y, interpolation=cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_REFLECT_101)
 
@@ -694,22 +731,28 @@ def build_cell_labels(shape, points):
 
 def compute_voronoi_cells(img, region_mask, n_points, rng):
     """Parte costosa (Canny + query cKDTree su ogni pixel): va ricalcolata
-    solo quando cambiano i punti seme (cioe' ai beat), non ad ogni frame."""
+    solo quando cambiano i punti seme (cioe' ai beat), non ad ogni frame.
+    Calcola anche i riquadri (bounding box) di ciascuna cella una sola volta
+    qui, cosi' apply_voronoi_displacement non deve piu' scansionare l'intera
+    immagine per ogni cella ad ogni singolo frame."""
     h, w = img.shape[:2]
     gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
     gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
     points = seed_points_in_region(gray_blur, region_mask, n_points, rng)
     labels = build_cell_labels((h, w), points)
-    return points, labels
+    boxes = ndimage.find_objects(labels + 1)
+    return points, labels, boxes
 
 
-def apply_voronoi_displacement(img, points, labels, intensity, rng, mode_score=0.0,
+def apply_voronoi_displacement(img, points, labels, boxes, intensity, rng, mode_score=0.0,
                                 complexity_score=0.5):
     """Parte economica (solo spostamento delle celle gia' segmentate): questa
     si ricalcola ad ogni frame perche' l'intensita' cambia con l'audio.
     mode_score: minore = i pezzi cadono di piu' (droop), maggiore = si
     spingono di piu' verso l'esterno (radiale/esplosivo). complexity_score
-    scala il rumore casuale per pezzo, per un caos maggiore su brani densi."""
+    scala il rumore casuale per pezzo, per un caos maggiore su brani densi.
+    Usa i riquadri (boxes) precalcolati una volta in compute_voronoi_cells,
+    invece di scansionare l'intera immagine per ogni cella ad ogni frame."""
     h, w = img.shape[:2]
     n_cells = len(points)
     cx = points[:, 0].mean()
@@ -738,11 +781,14 @@ def apply_voronoi_displacement(img, points, labels, intensity, rng, mode_score=0
     result = underlayer.copy()
 
     for i in range(n_cells):
-        cell_mask = (labels == i)
+        box = boxes[i] if i < len(boxes) else None
+        if box is None:
+            continue
+        y0, y1 = box[0].start, box[0].stop
+        x0, x1 = box[1].start, box[1].stop
+        cell_mask = (labels[y0:y1, x0:x1] == i)
         if not np.any(cell_mask):
             continue
-        ys, xs = np.where(cell_mask)
-        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
 
         shift_x = int(round(disp_x[i]))
         shift_y = int(round(disp_y[i]))
@@ -750,11 +796,12 @@ def apply_voronoi_displacement(img, points, labels, intensity, rng, mode_score=0
         nx0, nx1 = x0 + shift_x, x1 + shift_x
 
         src_y0, src_y1, src_x0, src_x1 = y0, y1, x0, x1
+        crop_top, crop_left = 0, 0
         if ny0 < 0:
-            src_y0 -= ny0
+            crop_top = -ny0
             ny0 = 0
         if nx0 < 0:
-            src_x0 -= nx0
+            crop_left = -nx0
             nx0 = 0
         if ny1 > h:
             src_y1 -= (ny1 - h)
@@ -762,12 +809,16 @@ def apply_voronoi_displacement(img, points, labels, intensity, rng, mode_score=0
         if nx1 > w:
             src_x1 -= (nx1 - w)
             nx1 = w
-        if ny1 <= ny0 or nx1 <= nx0:
+        src_y0 += crop_top
+        src_x0 += crop_left
+        if ny1 <= ny0 or nx1 <= nx0 or src_y1 <= src_y0 or src_x1 <= src_x0:
             continue
 
-        sub_mask = cell_mask[src_y0:src_y1, src_x0:src_x1]
+        sub_mask = cell_mask[src_y0 - y0:src_y1 - y0, src_x0 - x0:src_x1 - x0]
         sub_img = img[src_y0:src_y1, src_x0:src_x1]
         dest = result[ny0:ny1, nx0:nx1]
+        if dest.shape[:2] != sub_mask.shape:
+            continue
         dest[sub_mask] = sub_img[sub_mask]
         result[ny0:ny1, nx0:nx1] = dest
 
@@ -785,7 +836,7 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
     seed_offset = 0
 
     cache_rng = np.random.default_rng(seed)
-    points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+    points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -795,7 +846,7 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
         if f in beat_frames:
             seed_offset += 1
             cache_rng = np.random.default_rng(seed + seed_offset)
-            points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+            points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
         # bassi: intensita' della frattura, con colpo secco sul beat
         intensity = 0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)
@@ -803,7 +854,7 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             intensity *= 1.7
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
-        frame = apply_voronoi_displacement(base_img, points, labels, intensity, disp_rng,
+        frame = apply_voronoi_displacement(base_img, points, labels, boxes, intensity, disp_rng,
                                             mode_score=mode_score,
                                             complexity_score=complexity_score)
         frame = clinical_grade(frame)
@@ -938,7 +989,7 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
     rng = np.random.default_rng(seed)
 
     cache_rng = np.random.default_rng(seed)
-    points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+    points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
     n_walkers = max(n_points, 20)
     walker_pos = crack_seeds_from_labels(labels, n_walkers, rng, w, h)
@@ -966,7 +1017,7 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
         if f in beat_frames:
             seed_offset += 1
             cache_rng = np.random.default_rng(seed + seed_offset)
-            points, labels = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+            points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
             new_seeds = crack_seeds_from_labels(labels, 5, rng, w, h)
             walker_pos = np.concatenate([walker_pos, new_seeds], axis=0)
             walker_dir = np.concatenate(
@@ -977,7 +1028,7 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
             frac_intensity *= 1.6
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
-        fractured = apply_voronoi_displacement(base_img, points, labels, frac_intensity, disp_rng,
+        fractured = apply_voronoi_displacement(base_img, points, labels, boxes, frac_intensity, disp_rng,
                                                 mode_score=mode_score,
                                                 complexity_score=complexity_score)
 
