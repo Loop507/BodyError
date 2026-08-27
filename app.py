@@ -608,7 +608,7 @@ def apply_directional_stretch(img, center, radius, stretch_x, stretch_y, work_sc
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
                             seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
                             writer, mode_score=0.0, complexity_score=0.5,
-                            smile_override=None):
+                            smile_override=None, desync_amount=0.0):
     """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark,
     piu' dilatazione radiale (bulge) su occhi e viso intero e uno stretch
     direzionale legato al carattere del brano:
@@ -619,6 +619,12 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
       piu' frammentati di brani minimali
     - smile_override: se non None (da -1 a 1), sovrascrive il rilevamento
       automatico del sorriso dalla foto (ghigno se positivo, urlo se negativo)
+    - desync_amount (0..1): le parti del viso perdono la sincronia tra loro -
+      la mascella resta "in tempo" con i bassi (ancora), la bocca reagisce
+      IN RITARDO rispetto ai medi (letargica), gli occhi reagiscono IN
+      ANTICIPO rispetto agli alti (innaturale, come se "prevedessero" il
+      suono) - un classico del body horror: parti del corpo scollegate tra
+      loro nel tempo, non solo nello spazio
     Le tre bande hanno un carattere qualitativamente diverso, non solo
     un'intensita' diversa: bassi = colpo secco sulla mascella, medi = bocca
     che scatta aperta/chiusa a soglia, alti = tremore rapido sugli occhi."""
@@ -643,9 +649,17 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
 
     total_frames = len(env_bass)
     growth_acc = 0.0
+    mouth_lag = int(desync_amount * 10)
+    eye_lead = int(desync_amount * 6)
+
+    def shifted(env, f, shift):
+        idx = int(np.clip(f + shift, 0, total_frames - 1))
+        return float(env[idx])
 
     for f in range(total_frames):
-        eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
+        eb = shifted(env_bass, f, 0)
+        em = shifted(env_mid, f, -mouth_lag)
+        eh_ = shifted(env_high, f, eye_lead)
         avg_e = (eb + em + eh_) / 3.0
         growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
 
@@ -1238,6 +1252,14 @@ def main():
             "Forza urlo (-1) / ghigno (+1) / Force scream (-1) / grin (+1)",
             -1.0, 1.0, 0.0, 0.1, key="aw_smile_manual", disabled=aw_auto_smile,
         )
+        aw_desync = st.slider(
+            "Desincronizzazione parti del viso / Face parts desync", 0.0, 1.0, 0.0, 0.1,
+            key="aw_desync",
+            help="Bocca in ritardo, occhi in anticipo rispetto al resto: le "
+                 "parti del viso perdono la sincronia tra loro. 0 = tutto a "
+                 "tempo. / Mouth lags, eyes anticipate: facial parts fall "
+                 "out of sync with each other. 0 = everything on time.",
+        )
     with st.expander("Voronoi Fracture",
                       expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
         if style_key == STYLE_COMBO:
@@ -1412,6 +1434,7 @@ def main():
                         growth_rate=float(aw_growth), writer=writer,
                         mode_score=mode_score, complexity_score=complexity_score,
                         smile_override=None if aw_auto_smile else float(aw_smile_manual),
+                        desync_amount=float(aw_desync),
                     )
                 elif style_key == STYLE_VORONOI:
                     render_voronoi(
