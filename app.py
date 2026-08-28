@@ -38,12 +38,14 @@ STYLE_ANATOMICAL = "anatomical_warp"
 STYLE_VORONOI = "voronoi_fracture"
 STYLE_CAPILLARY = "capillary_bleed"
 STYLE_COMBO = "voronoi_capillary_combo"
+STYLE_LIQUID_DRAG = "liquid_drag"
 
 STYLE_LABELS = {
     STYLE_ANATOMICAL: "Anatomical Warp",
     STYLE_VORONOI: "Voronoi Fracture",
     STYLE_CAPILLARY: "Capillary Bleed",
     STYLE_COMBO: "Voronoi + Capillary (combo)",
+    STYLE_LIQUID_DRAG: "Liquid Drag",
 }
 
 ASPECT_PRESETS = {
@@ -1085,6 +1087,84 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
 
 
 # ---------------------------------------------------------------------------
+# STILE: LIQUID DRAG (trascinamento liquido orizzontale con ondulazione)
+# ---------------------------------------------------------------------------
+
+def apply_liquid_drag(img, cut_x, drag_strength, wave_amp, wave_freq, phase=0.0,
+                       direction=1, extent=None):
+    """La sorgente si comprime progressivamente verso cut_x man mano che ci
+    si allontana (il contenuto sembra "trascinato/colato" lateralmente),
+    combinato con un'onda sinusoidale verticale che cresce con la distanza -
+    da cut_x in poi il volto si scioglie in strisce orizzontali ondulate."""
+    h, w = img.shape[:2]
+    if extent is None:
+        extent = (w - cut_x) if direction > 0 else cut_x
+    extent = max(extent, 1.0)
+
+    xx, yy = np.meshgrid(np.arange(w).astype(np.float32), np.arange(h).astype(np.float32))
+
+    if direction > 0:
+        t = np.clip((xx - cut_x) / extent, 0, 1)
+        t = np.where(xx >= cut_x, t, 0.0)
+    else:
+        t = np.clip((cut_x - xx) / extent, 0, 1)
+        t = np.where(xx <= cut_x, t, 0.0)
+
+    src_x = cut_x + (xx - cut_x) * (1.0 - drag_strength * t)
+    wave = wave_amp * t * np.sin(2 * np.pi * wave_freq * t + phase + yy * 0.02)
+    src_y = yy + wave
+
+    src_x = np.clip(src_x, 0, w - 1).astype(np.float32)
+    src_y = np.clip(src_y, 0, h - 1).astype(np.float32)
+
+    return cv2.remap(img, src_x, src_y, interpolation=cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_REFLECT_101)
+
+
+def render_liquid_drag(base_img, pts, env_bass, env_mid, env_high, beat_frames, seed,
+                        base_intensity, growth_rate, writer, mode_score=0.0,
+                        complexity_score=0.5):
+    """Il trascinamento cresce nel tempo (progressione permanente) con colpi
+    secchi sul beat; gli ALTI pilotano la turbolenza dell'onda, la
+    COMPLESSITA' pilota quante onde ci sono; la TONALITA' decide la
+    direzione (minore = a sinistra, maggiore = a destra). Funziona anche
+    senza volto rilevato (ancora al centro immagine), quindi utile anche
+    per foto a figura intera."""
+    h, w = base_img.shape[:2]
+    rng = np.random.default_rng(seed)
+
+    if pts is not None:
+        cut_x = float((pts[:, 0].min() + pts[:, 0].max()) / 2.0)
+    else:
+        cut_x = w * 0.5
+    direction = 1 if mode_score >= 0 else -1
+    base_phase = rng.uniform(0, 2 * np.pi)
+
+    total_frames = len(env_bass)
+    growth_acc = 0.0
+
+    for f in range(total_frames):
+        eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
+        avg_e = (eb + em + eh_) / 3.0
+        growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
+
+        drag_strength = float(np.clip(
+            0.3 + base_intensity * (growth_acc * 0.6 + eb * 0.5), 0.0, 0.95))
+        if f in beat_frames:
+            drag_strength = min(drag_strength * 1.3, 0.95)
+
+        wave_amp = 12.0 + eh_ * 28.0 * base_intensity
+        wave_freq = 1.2 + complexity_score * 3.5
+        phase = base_phase + f * 0.12
+
+        frame = apply_liquid_drag(base_img, cut_x, drag_strength, wave_amp, wave_freq,
+                                   phase=phase, direction=direction)
+        frame = clinical_grade(frame)
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        writer.write(frame_u8)
+
+
+# ---------------------------------------------------------------------------
 # EXPORT VIDEO (streaming diretto su disco, mai l'intero video in RAM)
 # ---------------------------------------------------------------------------
 
@@ -1125,6 +1205,7 @@ STYLE_HASHTAGS = {
     STYLE_VORONOI: "#voronoifracture",
     STYLE_CAPILLARY: "#capillarybleed",
     STYLE_COMBO: "#voronoicapillary",
+    STYLE_LIQUID_DRAG: "#liquiddrag",
 }
 
 
@@ -1276,6 +1357,11 @@ def main():
                                   key="cb_intensity")
         cb_walkers = st.slider("Numero venature iniziali / Initial vein count", 10, 80, 40,
                                 5, key="cb_walkers")
+    with st.expander("Liquid Drag", expanded=(style_key == STYLE_LIQUID_DRAG)):
+        ld_intensity = st.slider("Intensita' trascinamento / Drag intensity", 0.2, 3.0, 1.2,
+                                  0.1, key="ld_intensity")
+        ld_growth = st.slider("Velocita' progressione / Growth rate", 0.5, 5.0, 2.0, 0.5,
+                               key="ld_growth")
 
     st.subheader("Formato / Format")
     col_res1, col_res2 = st.columns(2)
@@ -1456,6 +1542,13 @@ def main():
                         int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
                         n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
                         mode_score=mode_score, complexity_score=complexity_score,
+                    )
+                elif style_key == STYLE_LIQUID_DRAG:
+                    render_liquid_drag(
+                        base_img, pts, env_bass, env_mid, env_high, beat_frames, int(seed),
+                        base_intensity=float(ld_intensity), growth_rate=float(ld_growth),
+                        writer=writer, mode_score=mode_score,
+                        complexity_score=complexity_score,
                     )
                 else:
                     st.error("Stile non riconosciuto. / Unrecognized style.")
