@@ -39,6 +39,7 @@ STYLE_VORONOI = "voronoi_fracture"
 STYLE_CAPILLARY = "capillary_bleed"
 STYLE_COMBO = "voronoi_capillary_combo"
 STYLE_LIQUID_DRAG = "liquid_drag"
+STYLE_GLITCH_SLICE = "glitch_slice"
 
 STYLE_LABELS = {
     STYLE_ANATOMICAL: "Anatomical Warp",
@@ -46,6 +47,7 @@ STYLE_LABELS = {
     STYLE_CAPILLARY: "Capillary Bleed",
     STYLE_COMBO: "Voronoi + Capillary (combo)",
     STYLE_LIQUID_DRAG: "Liquid Drag",
+    STYLE_GLITCH_SLICE: "Glitch Slice",
 }
 
 ASPECT_PRESETS = {
@@ -1165,6 +1167,76 @@ def render_liquid_drag(base_img, pts, env_bass, env_mid, env_high, beat_frames, 
 
 
 # ---------------------------------------------------------------------------
+# STILE: GLITCH SLICE (fasce orizzontali casuali + aberrazione cromatica)
+# ---------------------------------------------------------------------------
+
+def apply_chromatic_shift(img, shift_amount):
+    """Separa i canali RGB con un piccolo offset orizzontale opposto
+    (aberrazione cromatica, il classico "bordo colorato" del glitch digitale)."""
+    if shift_amount < 0.3:
+        return img
+    h, w = img.shape[:2]
+    b, g, r = cv2.split(img)
+    m_r = np.float32([[1, 0, shift_amount], [0, 1, 0]])
+    m_b = np.float32([[1, 0, -shift_amount], [0, 1, 0]])
+    r_shifted = cv2.warpAffine(r, m_r, (w, h), borderMode=cv2.BORDER_REFLECT)
+    b_shifted = cv2.warpAffine(b, m_b, (w, h), borderMode=cv2.BORDER_REFLECT)
+    return cv2.merge([b_shifted, g, r_shifted])
+
+
+def render_glitch_slice(base_img, env_bass, env_mid, env_high, beat_frames, seed,
+                         base_intensity, growth_rate, writer, complexity_score=0.5):
+    """Fasce orizzontali che scivolano lateralmente, con nascita/morte
+    CASUALE nel tempo (mai la stessa posizione, dimensione o durata due
+    volte) - la casualita' strutturale, non solo l'intensita', e' quello
+    che evita l'effetto "sempre uguale". Gli alti pilotano la frequenza di
+    comparsa di nuove fasce, i bassi la loro ampiezza di scivolamento e
+    l'aberrazione cromatica complessiva, la complessita' spettrale quante
+    fasce nascono insieme."""
+    h, w = base_img.shape[:2]
+    rng = np.random.default_rng(seed)
+    total_frames = len(env_bass)
+    growth_acc = 0.0
+    active = []
+
+    for f in range(total_frames):
+        eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
+        avg_e = (eb + em + eh_) / 3.0
+        growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
+
+        spawn_prob = 0.08 + eh_ * 0.5 * (0.5 + complexity_score)
+        if f in beat_frames or rng.uniform(0, 1) < spawn_prob:
+            n_new = int(rng.integers(1, 3 + int(complexity_score * 4)))
+            for _ in range(n_new):
+                band_h = int(rng.uniform(6, 12 + 50 * growth_acc))
+                y0 = int(rng.uniform(0, max(h - band_h, 1)))
+                shift = rng.uniform(-1, 1) * (15 + 90 * base_intensity) * (0.3 + growth_acc * 0.7 + eb * 0.5)
+                life = int(rng.uniform(2, 6 + 6 * complexity_score))
+                active.append({"y0": y0, "y1": y0 + band_h, "shift": shift, "life": life})
+
+        frame = base_img.copy()
+        still_active = []
+        for g in active:
+            if g["life"] <= 0:
+                continue
+            y0, y1 = g["y0"], g["y1"]
+            band = frame[y0:y1, :]
+            m = np.float32([[1, 0, g["shift"]], [0, 1, 0]])
+            shifted_band = cv2.warpAffine(band, m, (w, y1 - y0), borderMode=cv2.BORDER_REFLECT)
+            frame[y0:y1, :] = shifted_band
+            g["life"] -= 1
+            still_active.append(g)
+        active = still_active
+
+        chroma_shift = 1.0 + (growth_acc * 0.5 + eb * 0.5) * base_intensity * 4.0
+        frame = apply_chromatic_shift(frame, chroma_shift)
+
+        frame = clinical_grade(frame)
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        writer.write(frame_u8)
+
+
+# ---------------------------------------------------------------------------
 # EXPORT VIDEO (streaming diretto su disco, mai l'intero video in RAM)
 # ---------------------------------------------------------------------------
 
@@ -1206,6 +1278,7 @@ STYLE_HASHTAGS = {
     STYLE_CAPILLARY: "#capillarybleed",
     STYLE_COMBO: "#voronoicapillary",
     STYLE_LIQUID_DRAG: "#liquiddrag",
+    STYLE_GLITCH_SLICE: "#glitchslice",
 }
 
 
@@ -1362,6 +1435,11 @@ def main():
                                   0.1, key="ld_intensity")
         ld_growth = st.slider("Velocita' progressione / Growth rate", 0.5, 5.0, 2.0, 0.5,
                                key="ld_growth")
+    with st.expander("Glitch Slice", expanded=(style_key == STYLE_GLITCH_SLICE)):
+        gs_intensity = st.slider("Intensita' glitch / Glitch intensity", 0.2, 3.0, 1.2, 0.1,
+                                  key="gs_intensity")
+        gs_growth = st.slider("Velocita' progressione / Growth rate", 0.5, 5.0, 2.0, 0.5,
+                               key="gs_growth")
 
     st.subheader("Formato / Format")
     col_res1, col_res2 = st.columns(2)
@@ -1549,6 +1627,12 @@ def main():
                         base_intensity=float(ld_intensity), growth_rate=float(ld_growth),
                         writer=writer, mode_score=mode_score,
                         complexity_score=complexity_score,
+                    )
+                elif style_key == STYLE_GLITCH_SLICE:
+                    render_glitch_slice(
+                        base_img, env_bass, env_mid, env_high, beat_frames, int(seed),
+                        base_intensity=float(gs_intensity), growth_rate=float(gs_growth),
+                        writer=writer, complexity_score=complexity_score,
                     )
                 else:
                     st.error("Stile non riconosciuto. / Unrecognized style.")
