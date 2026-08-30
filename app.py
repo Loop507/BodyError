@@ -40,6 +40,7 @@ STYLE_CAPILLARY = "capillary_bleed"
 STYLE_COMBO = "voronoi_capillary_combo"
 STYLE_LIQUID_DRAG = "liquid_drag"
 STYLE_GLITCH_SLICE = "glitch_slice"
+STYLE_TOTAL_CHAOS = "total_chaos"
 
 STYLE_LABELS = {
     STYLE_ANATOMICAL: "Anatomical Warp",
@@ -48,6 +49,7 @@ STYLE_LABELS = {
     STYLE_COMBO: "Voronoi + Capillary (combo)",
     STYLE_LIQUID_DRAG: "Liquid Drag",
     STYLE_GLITCH_SLICE: "Glitch Slice",
+    STYLE_TOTAL_CHAOS: "Body Error Totale (tutte le tecniche)",
 }
 
 ASPECT_PRESETS = {
@@ -1237,6 +1239,228 @@ def render_glitch_slice(base_img, env_bass, env_mid, env_high, beat_frames, seed
 
 
 # ---------------------------------------------------------------------------
+# STILE: BODY ERROR TOTALE (tutte le tecniche insieme, attivazione
+# progressiva legata all'energia audio accumulata nel tempo)
+# ---------------------------------------------------------------------------
+
+# soglie di growth_acc a cui ogni tecnica aggiuntiva si attiva, in ordine:
+# la mesh anatomica c'e' sempre (se c'e' un volto), poi via via le altre si
+# sommano fino al collasso totale nel finale di un brano lungo
+_CHAOS_THRESH_VORONOI = 0.15
+_CHAOS_THRESH_CAPILLARY = 0.30
+_CHAOS_THRESH_LIQUID = 0.50
+_CHAOS_THRESH_GLITCH = 0.70
+
+
+def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
+                        beat_frames, seed, base_intensity, growth_rate, writer,
+                        mode_score=0.0, complexity_score=0.5, smile_override=None,
+                        desync_amount=0.0):
+    """Tutte le tecniche insieme: mesh anatomica sempre attiva (se c'e' un
+    volto), poi Voronoi/Capillary/Liquid Drag/Glitch Slice si accendono uno
+    alla volta man mano che l'energia audio accumulata (growth_acc) supera
+    soglie crescenti - su un brano lungo il volto collassa progressivamente
+    sotto il peso di tutte le distorsioni sommate. Costo computazionale
+    concentrato nella parte finale del brano, non costante per tutta la
+    durata, per restare gestibile anche su render lunghi."""
+    h, w = base_img.shape[:2]
+    rng = np.random.default_rng(seed)
+    total_frames = len(env_bass)
+    growth_acc = 0.0
+
+    has_face = pts is not None
+    if has_face:
+        all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
+        triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+        eye_r_center = tuple(pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0))
+        eye_l_center = tuple(pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0))
+        eye_width = float(np.linalg.norm(pts[36] - pts[39]))
+        eye_radius = max(eye_width * 1.6, 12.0)
+        face_center = tuple(pts.mean(axis=0))
+        face_radius = max(float(np.ptp(pts[:, 0])) * 0.8, 30.0)
+        stretch_radius = max(float(np.ptp(pts[:, 0])) * 1.7, 60.0)
+        asym_l, asym_r = 1.0 + rng.uniform(-0.3, 0.3, 2) * complexity_score
+        smile_bias = compute_smile_score(pts) if smile_override is None else float(smile_override)
+        cut_x = float((pts[:, 0].min() + pts[:, 0].max()) / 2.0)
+    else:
+        cut_x = w * 0.5
+
+    # Voronoi: meno celle del default per contenere il costo quando sommato
+    # alle altre tecniche
+    n_points_chaos = 16
+    cache_rng = np.random.default_rng(seed)
+    points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points_chaos, cache_rng)
+    seed_offset = 0
+
+    # Capillary: setup identico alla versione standalone ma con meno semi
+    n_walkers_chaos = 20
+    gray = cv2.cvtColor((base_img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    gx = cv2.Sobel(gray_blur, cv2.CV_32F, 1, 0, ksize=5)
+    gy = cv2.Sobel(gray_blur, cv2.CV_32F, 0, 1, ksize=5)
+    mag = np.sqrt(gx ** 2 + gy ** 2) + 1e-6
+    gx_n, gy_n = gx / mag, gy / mag
+    if has_face:
+        seed_idx = (LANDMARK_GROUPS["eye_r"] + LANDMARK_GROUPS["eye_l"]
+                    + LANDMARK_GROUPS["mouth"] + LANDMARK_GROUPS["jaw"]
+                    + LANDMARK_GROUPS["nose"])
+        candidates = pts[seed_idx]
+        idx = rng.choice(len(candidates), min(n_walkers_chaos, len(candidates)), replace=False)
+        walker_pos = candidates[idx].copy().astype(np.float32)
+    else:
+        edges = cv2.Canny(gray_blur, 50, 130).astype(np.float32) * region_mask
+        ys, xs = np.where(edges > 0)
+        if len(xs) == 0:
+            ys, xs = np.array([h // 2]), np.array([w // 2])
+        idx = rng.choice(len(xs), min(n_walkers_chaos, len(xs)), replace=False)
+        walker_pos = np.stack([xs[idx], ys[idx]], axis=1).astype(np.float32)
+    walker_dir = rng.uniform(-1, 1, walker_pos.shape).astype(np.float32)
+    vein_mask = np.zeros((h, w), dtype=np.float32)
+    bleed_color = np.array([0.05, 0.02, 0.35], dtype=np.float32)
+    max_walkers_chaos = n_walkers_chaos * 5
+
+    direction_ld = 1 if mode_score >= 0 else -1
+    base_phase = rng.uniform(0, 2 * np.pi)
+    mouth_lag = int(desync_amount * 10)
+    eye_lead = int(desync_amount * 6)
+    active_glitches = []
+
+    def shifted(env, f, shift):
+        idx2 = int(np.clip(f + shift, 0, total_frames - 1))
+        return float(env[idx2])
+
+    for f in range(total_frames):
+        eb = shifted(env_bass, f, 0)
+        em = shifted(env_mid, f, -mouth_lag)
+        eh_ = shifted(env_high, f, eye_lead)
+        avg_e = (eb + em + eh_) / 3.0
+        growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
+
+        frame = base_img.copy()
+
+        # 1) MESH ANATOMICA - sempre attiva se c'e' un volto
+        if has_face:
+            permanent = growth_acc * base_intensity * 0.6
+            jaw_i = permanent + eb * base_intensity
+            if f in beat_frames:
+                jaw_i *= 2.2
+            mouth_i = permanent * 0.4 + base_intensity * mid_gate(em)
+            eye_i = permanent * 0.3 + eh_ * base_intensity * 0.4
+            eye_jitter = eh_ * (0.6 + complexity_score * 0.8)
+
+            displaced = build_dynamic_displacement(pts, jaw_i, mouth_i, eye_i, eye_jitter,
+                                                    rng, smile_bias=smile_bias)
+            for i in LANDMARK_GROUPS["jaw"][:9]:
+                displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_l
+            for i in LANDMARK_GROUPS["jaw"][9:]:
+                displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_r
+
+            frame = warp_face_mesh(frame, all_src_pts, displaced, hull_expanded, triangles_idx)
+
+            eye_bulge = float(np.clip(0.25 + eye_i * 0.9, 0.0, 0.9))
+            frame = apply_bulge_roi(frame, eye_r_center, eye_radius, eye_bulge)
+            frame = apply_bulge_roi(frame, eye_l_center, eye_radius, eye_bulge)
+            face_bulge = float(np.clip(permanent * 0.7 + eb * 0.3, -0.9, 0.9))
+            frame = apply_bulge_roi(frame, face_center, face_radius, face_bulge)
+
+            stretch_amount = permanent * 0.8
+            if mode_score < 0:
+                frame = apply_directional_stretch(frame, face_center, stretch_radius, 0.0,
+                                                   stretch_amount * (1.0 + abs(mode_score)))
+            else:
+                frame = apply_directional_stretch(frame, face_center, stretch_radius,
+                                                   stretch_amount * (1.0 + mode_score), 0.0)
+
+        # 2) VORONOI FRACTURE - si accende quando l'energia accumulata basta
+        if growth_acc > _CHAOS_THRESH_VORONOI:
+            if f in beat_frames:
+                seed_offset += 1
+                cache_rng2 = np.random.default_rng(seed + seed_offset)
+                points_new, labels_new, boxes_new = compute_voronoi_cells(
+                    base_img, region_mask, n_points_chaos, cache_rng2)
+                points, labels, boxes = points_new, labels_new, boxes_new
+            vor_intensity = (growth_acc - _CHAOS_THRESH_VORONOI) * base_intensity * 0.9
+            disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
+            frame = apply_voronoi_displacement(frame, points, labels, boxes, vor_intensity,
+                                                disp_rng, mode_score=mode_score,
+                                                complexity_score=complexity_score)
+
+        # 3) CAPILLARY BLEED - le venature crescono sempre "sotto traccia" ma
+        # diventano visibili solo passata la soglia
+        step_size = 1.0 + 3.0 * em
+        xi = np.clip(walker_pos[:, 0].astype(int), 0, w - 1)
+        yi = np.clip(walker_pos[:, 1].astype(int), 0, h - 1)
+        tangent_x = -gy_n[yi, xi]
+        tangent_y = gx_n[yi, xi]
+        rand_perturb = rng.uniform(-0.4, 0.4, walker_dir.shape).astype(np.float32)
+        walker_dir = (0.7 * walker_dir + 0.3 * np.stack([tangent_x, tangent_y], axis=1)
+                      + rand_perturb)
+        norm = np.linalg.norm(walker_dir, axis=1, keepdims=True) + 1e-6
+        walker_dir = walker_dir / norm
+        walker_pos = walker_pos + walker_dir * step_size
+        walker_pos[:, 0] = np.clip(walker_pos[:, 0], 0, w - 1)
+        walker_pos[:, 1] = np.clip(walker_pos[:, 1], 0, h - 1)
+        vein_mask[walker_pos[:, 1].astype(int), walker_pos[:, 0].astype(int)] = 1.0
+        branch_prob = eh_ * 0.4 * (0.6 + complexity_score)
+        if (f in beat_frames or rng.uniform(0, 1) < branch_prob) and len(walker_pos) < max_walkers_chaos:
+            n_new = min(3, n_walkers_chaos)
+            branch_idx = rng.integers(0, len(walker_pos), n_new)
+            new_pos = walker_pos[branch_idx] + rng.uniform(-2, 2, (n_new, 2))
+            new_pos[:, 0] = np.clip(new_pos[:, 0], 0, w - 1)
+            new_pos[:, 1] = np.clip(new_pos[:, 1], 0, h - 1)
+            new_dir = rng.uniform(-1, 1, (n_new, 2)).astype(np.float32)
+            walker_pos = np.concatenate([walker_pos, new_pos.astype(np.float32)], axis=0)
+            walker_dir = np.concatenate([walker_dir, new_dir], axis=0)
+
+        if growth_acc > _CHAOS_THRESH_CAPILLARY:
+            vein_blur = cv2.GaussianBlur(vein_mask, (3, 3), 0)
+            vein_blur = np.clip(vein_blur * region_mask, 0, 1)
+            cap_amount = (growth_acc - _CHAOS_THRESH_CAPILLARY) * base_intensity
+            alpha = vein_blur[..., None] * (0.4 + 0.5 * eb) * cap_amount
+            frame = frame * (1 - alpha) + bleed_color * alpha
+
+        # 4) LIQUID DRAG - si accende a meta' percorso circa
+        if growth_acc > _CHAOS_THRESH_LIQUID:
+            drag_strength = float(np.clip(
+                (growth_acc - _CHAOS_THRESH_LIQUID) * base_intensity * 1.3, 0.0, 0.9))
+            wave_amp = 10.0 + eh_ * 25.0 * base_intensity
+            wave_freq = 1.5 + complexity_score * 3.0
+            phase = base_phase + f * 0.12
+            frame = apply_liquid_drag(frame, cut_x, drag_strength, wave_amp, wave_freq,
+                                       phase=phase, direction=direction_ld)
+
+        # 5) GLITCH SLICE - il climax finale
+        if growth_acc > _CHAOS_THRESH_GLITCH:
+            glitch_room = (growth_acc - _CHAOS_THRESH_GLITCH) / max(1 - _CHAOS_THRESH_GLITCH, 1e-6)
+            spawn_prob = 0.06 + eh_ * 0.4 * (0.5 + complexity_score)
+            if f in beat_frames or rng.uniform(0, 1) < spawn_prob:
+                n_new = int(rng.integers(1, 2 + int(complexity_score * 3)))
+                for _ in range(n_new):
+                    band_h = int(rng.uniform(6, 10 + 40 * glitch_room))
+                    y0 = int(rng.uniform(0, max(h - band_h, 1)))
+                    shift = rng.uniform(-1, 1) * (10 + 70 * base_intensity) * glitch_room
+                    life = int(rng.uniform(2, 6))
+                    active_glitches.append({"y0": y0, "y1": y0 + band_h, "shift": shift, "life": life})
+            still_active = []
+            for g in active_glitches:
+                if g["life"] <= 0:
+                    continue
+                y0, y1 = g["y0"], g["y1"]
+                band = frame[y0:y1, :]
+                m = np.float32([[1, 0, g["shift"]], [0, 1, 0]])
+                shifted_band = cv2.warpAffine(band, m, (w, y1 - y0), borderMode=cv2.BORDER_REFLECT)
+                frame[y0:y1, :] = shifted_band
+                g["life"] -= 1
+                still_active.append(g)
+            active_glitches = still_active
+            frame = apply_chromatic_shift(frame, 1.0 + glitch_room * base_intensity * 3.0)
+
+        frame = clinical_grade(frame)
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        writer.write(frame_u8)
+
+
+# ---------------------------------------------------------------------------
 # EXPORT VIDEO (streaming diretto su disco, mai l'intero video in RAM)
 # ---------------------------------------------------------------------------
 
@@ -1279,6 +1503,7 @@ STYLE_HASHTAGS = {
     STYLE_COMBO: "#voronoicapillary",
     STYLE_LIQUID_DRAG: "#liquiddrag",
     STYLE_GLITCH_SLICE: "#glitchslice",
+    STYLE_TOTAL_CHAOS: "#bodyerrortotale",
 }
 
 
@@ -1440,6 +1665,31 @@ def main():
                                   key="gs_intensity")
         gs_growth = st.slider("Velocita' progressione / Growth rate", 0.5, 5.0, 2.0, 0.5,
                                key="gs_growth")
+    with st.expander("Body Error Totale", expanded=(style_key == STYLE_TOTAL_CHAOS)):
+        st.caption(
+            "Tutte le tecniche insieme, attivate progressivamente man mano "
+            "che l'energia del brano si accumula: mesh anatomica -> Voronoi "
+            "-> venature -> trascinamento liquido -> glitch a fasce. Su un "
+            "brano lungo il volto collassa del tutto nel finale. / All "
+            "techniques together, activated progressively as the track's "
+            "energy accumulates. On a long track the face fully collapses "
+            "by the end."
+        )
+        tc_intensity = st.slider("Intensita' complessiva / Overall intensity", 0.2, 3.0, 1.2,
+                                  0.1, key="tc_intensity")
+        tc_growth = st.slider("Velocita' collasso / Collapse rate", 0.3, 3.0, 1.0, 0.1,
+                               key="tc_growth",
+                               help="Piu' basso = il collasso totale arriva solo verso la "
+                                    "fine di brani lunghi. Piu' alto = arriva prima. / Lower "
+                                    "= full collapse only near the end of long tracks. "
+                                    "Higher = arrives sooner.")
+        st.warning(
+            "Combina tutte le tecniche: su render lunghi e ad alta "
+            "risoluzione il tempo di rendering puo' essere significativo. "
+            "Prova prima con l'anteprima 5s. / Combines every technique: on "
+            "long, high-res renders the render time can be significant. "
+            "Try the 5s preview first."
+        )
 
     st.subheader("Formato / Format")
     col_res1, col_res2 = st.columns(2)
@@ -1633,6 +1883,15 @@ def main():
                         base_img, env_bass, env_mid, env_high, beat_frames, int(seed),
                         base_intensity=float(gs_intensity), growth_rate=float(gs_growth),
                         writer=writer, complexity_score=complexity_score,
+                    )
+                elif style_key == STYLE_TOTAL_CHAOS:
+                    render_total_chaos(
+                        base_img, pts, region_mask, env_bass, env_mid, env_high, beat_frames,
+                        int(seed), base_intensity=float(tc_intensity),
+                        growth_rate=float(tc_growth), writer=writer, mode_score=mode_score,
+                        complexity_score=complexity_score,
+                        smile_override=None if aw_auto_smile else float(aw_smile_manual),
+                        desync_amount=float(aw_desync),
                     )
                 else:
                     st.error("Stile non riconosciuto. / Unrecognized style.")
