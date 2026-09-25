@@ -36,6 +36,7 @@ except ImportError:
 APP_TITLE = "BodyError // Loop507"
 
 STYLE_ANATOMICAL = "anatomical_warp"
+STYLE_DESTRUCTION = "anatomical_destruction"
 STYLE_VORONOI = "voronoi_fracture"
 STYLE_CAPILLARY = "capillary_bleed"
 STYLE_COMBO = "voronoi_capillary_combo"
@@ -45,6 +46,7 @@ STYLE_TOTAL_CHAOS = "total_chaos"
 
 STYLE_LABELS = {
     STYLE_ANATOMICAL: "Anatomical Warp",
+    STYLE_DESTRUCTION: "Anatomical Destruction (danno permanente)",
     STYLE_VORONOI: "Voronoi Fracture",
     STYLE_CAPILLARY: "Capillary Bleed",
     STYLE_COMBO: "Voronoi + Capillary (combo)",
@@ -529,6 +531,100 @@ def warp_face_mesh_fast(base_img, src_data, displaced_landmarks, hull_expanded, 
     return output
 
 
+def _group_hull_mask(shape, pts, group_idx, dilate_px=6):
+    """Maschera binaria (uint8, 0/255) del convex hull di un gruppo di
+    landmark, con un margine di dilatazione per non lasciare un bordo
+    netto visibile."""
+    h, w = shape[:2]
+    hull = cv2.convexHull(pts[group_idx].astype(np.int32))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, hull, 255)
+    if dilate_px > 0:
+        mask = cv2.dilate(mask, np.ones((dilate_px, dilate_px), np.uint8))
+    return mask
+
+
+def dislocate_feature(frame, hull_mask, offset, hole_fill="inpaint"):
+    """Stacca fisicamente la regione (occhio/bocca) e la trasla, lasciando
+    un buco vero al posto originale - non e' un warp che tira la mesh,
+    e' un pezzo che se ne va e non torna. offset e' un vettore (dx, dy)
+    che deve crescere in modo monotono nel tempo (mai in discesa) perche'
+    il danno resti permanente."""
+    h, w = frame.shape[:2]
+    dx, dy = int(round(offset[0])), int(round(offset[1]))
+
+    if hole_fill == "inpaint":
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        filled = cv2.inpaint(frame_u8, hull_mask, 5, cv2.INPAINT_TELEA)
+        base = filled.astype(np.float32) / 255.0
+    else:
+        base = frame.copy()
+        base[hull_mask > 0] = 0.0
+
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    moved_patch = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_CONSTANT)
+    moved_mask = cv2.warpAffine(hull_mask, M, (w, h), borderMode=cv2.BORDER_CONSTANT)
+    m3 = (moved_mask[..., None] > 0).astype(np.float32)
+    return base * (1 - m3) + moved_patch * m3
+
+
+def corrode_feature(frame, hull_mask, growth_px, rng, corrosion_color=None):
+    """Consuma la regione dall'interno verso l'esterno: la maschera si
+    espande (dilate) in modo monotono con growth_px, mai in contrazione,
+    quindi il danno non si richiude mai. Il contenuto eroso viene
+    sostituito da rumore/colore, non da un tentativo di 'riparare'."""
+    if growth_px <= 0:
+        return frame
+    kernel = np.ones((3, 3), np.uint8)
+    grown_mask = cv2.dilate(hull_mask, kernel, iterations=int(growth_px))
+    if corrosion_color is None:
+        noise = rng.uniform(0, 0.15, frame.shape).astype(np.float32)
+    else:
+        noise = np.broadcast_to(np.array(corrosion_color, dtype=np.float32),
+                                 frame.shape).copy()
+        noise += rng.uniform(-0.03, 0.03, frame.shape).astype(np.float32)
+    m3 = (grown_mask[..., None] > 0).astype(np.float32)
+    return frame * (1 - m3) + np.clip(noise, 0, 1) * m3
+
+
+def explode_group(pts, group_idx, center, t_since_trigger, rng, accel=0.008):
+    """I punti del gruppo (es. bocca) accelerano verso l'esterno invece di
+    convergere verso una nuova forma stabile: t_since_trigger**2 fa si'
+    che il moto acceleri nel tempo, non si stabilizzi mai."""
+    displaced = pts.copy()
+    for i in group_idx:
+        direction = pts[i] - center
+        norm = np.linalg.norm(direction)
+        direction = direction / norm if norm > 1e-6 else rng.uniform(-1, 1, 2)
+        jitter = rng.uniform(-0.3, 0.3, 2)
+        displaced[i] = pts[i] + (direction + jitter) * (float(t_since_trigger) ** 2) * accel
+    return displaced
+
+
+def tear_strips(frame, x0, y0, w, h, n_strips, offsets, fill_color):
+    """Taglia la bounding box in strisce orizzontali con offset diversi e
+    crescenti (alcune a destra, alcune a sinistra): effetto 'carta
+    strappata', i varchi si riempiono di fill_color, non della texture
+    circostante - deve leggersi come uno strappo, non come uno spostamento."""
+    x0, y0 = max(0, x0), max(0, y0)
+    w = min(w, frame.shape[1] - x0)
+    h = min(h, frame.shape[0] - y0)
+    if w <= 0 or h <= 0 or n_strips <= 0:
+        return frame
+    strip_h = max(h // n_strips, 1)
+    out = frame.copy()
+    for i in range(n_strips):
+        y = y0 + i * strip_h
+        if y + strip_h > frame.shape[0]:
+            break
+        dx = int(offsets[i]) if i < len(offsets) else 0
+        strip = frame[y:y + strip_h, x0:x0 + w].copy()
+        out[y:y + strip_h, x0:x0 + w] = fill_color
+        x_dst = int(np.clip(x0 + dx, 0, frame.shape[1] - w))
+        out[y:y + strip_h, x_dst:x_dst + w] = strip
+    return out
+
+
 def compute_smile_score(pts):
     """Curvatura della bocca nella foto ORIGINALE (dai landmark, non da Haar
     Cascade - piu' preciso): positivo se sorride, vicino a zero/negativo se
@@ -801,6 +897,105 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         writer.write(frame_u8)
+
+
+# ---------------------------------------------------------------------------
+# STILE: ANATOMICAL DESTRUCTION (danno permanente e progressivo, non
+# reversibile: le feature non tornano mai verso una forma stabile)
+# ---------------------------------------------------------------------------
+
+def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, beat_frames,
+                                   seed, base_intensity, growth_rate, writer,
+                                   mode_score=0.0, complexity_score=0.5,
+                                   enable_corrode=True, enable_dislocate=True,
+                                   enable_explode=True, enable_tear=True):
+    """Stessa mesh anatomica di Anatomical Warp come base, ma superate
+    soglie crescenti di energia accumulata (growth_acc, monotona) le
+    feature vengono DANNEGGIATE in modo permanente invece di deformate
+    elasticamente:
+    - occhi: corrosi dall'interno (corrode_feature), soglia bassa - i
+      primi a saltare, guidati dagli alti
+    - naso/bocca: dislocati fisicamente (dislocate_feature), soglia media,
+      guidati dai medi - il pezzo si stacca e lascia un buco
+    - bocca: esplode in frammenti radiali (explode_group) accelerando nel
+      tempo, soglia alta, guidata dai bassi/beat
+    - meta' inferiore del volto: strappata a strisce (tear_strips), soglia
+      massima, quando il collasso e' quasi completo
+    Ogni soglia, una volta superata, resta attiva per tutti i frame
+    successivi (niente reset): il danno si accumula e non guarisce."""
+    rng = np.random.default_rng(seed)
+    h, w = base_img.shape[:2]
+    all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
+    triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+    src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
+
+    eye_r_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_r"])
+    eye_l_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_l"])
+    nose_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["nose"])
+    mouth_center = pts[LANDMARK_GROUPS["mouth"]].mean(axis=0)
+    mouth_bbox = cv2.boundingRect(pts[LANDMARK_GROUPS["jaw"]].astype(np.int32))
+
+    # soglie su growth_acc (0..1): occhi si corrodono prima, la meta'
+    # inferiore del volto si strappa solo a collasso quasi completo
+    thr_eye, thr_nose, thr_mouth, thr_tear = 0.15, 0.35, 0.55, 0.8
+
+    total_frames = len(env_bass)
+    growth_acc = 0.0
+    frame_mouth_trigger = None  # primo frame in cui si supera thr_mouth
+
+    for f in range(total_frames):
+        eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
+        avg_e = (eb + em + eh_) / 3.0
+        growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
+
+        displaced = pts.copy()
+        frame_src = base_img
+
+        # 1) esplosione bocca: se innescata, agisce sui landmark PRIMA del
+        # warp della mesh (quindi passa dentro warp_face_mesh_fast)
+        if enable_explode and growth_acc >= thr_mouth:
+            if frame_mouth_trigger is None:
+                frame_mouth_trigger = f
+            t_since = f - frame_mouth_trigger
+            displaced = explode_group(displaced, LANDMARK_GROUPS["mouth"], mouth_center,
+                                       t_since, rng, accel=0.01 * base_intensity)
+            if f in beat_frames:
+                displaced[LANDMARK_GROUPS["mouth"]] += rng.uniform(-6, 6, (
+                    len(LANDMARK_GROUPS["mouth"]), 2)) * eb
+
+        frame = warp_face_mesh_fast(frame_src, src_data, displaced, hull_expanded, triangles_idx)
+
+        # 2) corrosione occhi: guidata dagli alti, soglia piu' bassa
+        if enable_corrode and growth_acc >= thr_eye:
+            eye_growth_px = (growth_acc - thr_eye) / max(1.0 - thr_eye, 1e-6) * 14.0 * base_intensity
+            eye_growth_px += eh_ * 2.0
+            frame = corrode_feature(frame, eye_r_mask, eye_growth_px, rng)
+            frame = corrode_feature(frame, eye_l_mask, eye_growth_px, rng)
+
+        # 3) dislocazione naso: guidata dai medi, soglia intermedia,
+        # l'offset cresce in modo monotono con growth_acc (mai a ritroso)
+        if enable_dislocate and growth_acc >= thr_nose:
+            nose_offset = ((growth_acc - thr_nose) / max(1.0 - thr_nose, 1e-6)) * np.array(
+                [10.0, 40.0]) * base_intensity + np.array([em * 4.0, 0.0])
+            frame = dislocate_feature(frame, nose_mask, nose_offset, hole_fill="inpaint")
+
+        # 4) strappo a strisce sulla meta' inferiore del volto: solo a
+        # collasso quasi completo, resta attivo una volta innescato
+        if enable_tear and growth_acc >= thr_tear:
+            tear_progress = (growth_acc - thr_tear) / max(1.0 - thr_tear, 1e-6)
+            n_strips = 6
+            offsets = [(rng.uniform(-1, 1)) * tear_progress * 40.0 * base_intensity
+                       for _ in range(n_strips)]
+            bleed = np.array([0.05, 0.02, 0.35], dtype=np.float32)
+            mx, my, mw, mh = mouth_bbox
+            frame = tear_strips(frame, mx - 10, my + mh // 3, mw + 20, mh - mh // 3,
+                                 n_strips, offsets, bleed)
+
+        frame = clinical_grade(frame)
+        frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+        writer.write(frame_u8)
+
+
 # ---------------------------------------------------------------------------
 # STILE: VORONOI FRACTURE (rifatto: niente linee finte, contenuto reale
 # nei varchi, separazione guidata dai bassi)
@@ -1582,6 +1777,7 @@ def finalize_video(raw_video_path, audio_path, duration_sec, out_path):
 
 STYLE_HASHTAGS = {
     STYLE_ANATOMICAL: "#anatomicalwarp",
+    STYLE_DESTRUCTION: "#anatomicaldestruction",
     STYLE_VORONOI: "#voronoifracture",
     STYLE_CAPILLARY: "#capillarybleed",
     STYLE_COMBO: "#voronoicapillary",
@@ -1723,6 +1919,31 @@ def main():
                  "tempo. / Mouth lags, eyes anticipate: facial parts fall "
                  "out of sync with each other. 0 = everything on time.",
         )
+    with st.expander("Anatomical Destruction",
+                      expanded=(style_key == STYLE_DESTRUCTION)):
+        st.caption(
+            "Danno permanente e progressivo, non elastico: le feature non "
+            "tornano mai a una forma stabile. Disattiva singole tecniche "
+            "per vedere come interagiscono con la foto originale. / "
+            "Permanent, progressive damage, not elastic: features never "
+            "settle back into a stable shape. Toggle individual "
+            "techniques to see how they interact with the source photo."
+        )
+        ad_intensity = st.slider("Intensita' danno / Damage intensity", 0.2, 3.0, 1.0, 0.1,
+                                  key="ad_intensity")
+        ad_growth = st.slider("Velocita' accumulo / Accumulation rate", 0.3, 3.0, 1.0, 0.1,
+                               key="ad_growth")
+        col_ad1, col_ad2 = st.columns(2)
+        with col_ad1:
+            ad_corrode = st.checkbox("Corrosione occhi / Eye corrosion", value=True,
+                                      key="ad_corrode")
+            ad_dislocate = st.checkbox("Dislocazione naso / Nose dislocation", value=True,
+                                        key="ad_dislocate")
+        with col_ad2:
+            ad_explode = st.checkbox("Esplosione bocca / Mouth explosion", value=True,
+                                      key="ad_explode")
+            ad_tear = st.checkbox("Strappo a strisce / Strip tear", value=True,
+                                   key="ad_tear")
     with st.expander("Voronoi Fracture",
                       expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
         if style_key == STYLE_COMBO:
@@ -1905,9 +2126,10 @@ def main():
 
             region_mask = build_background_subject_mask(base_img)
 
-            if style_key == STYLE_ANATOMICAL and pts is None:
+            if style_key in (STYLE_ANATOMICAL, STYLE_DESTRUCTION) and pts is None:
                 st.error(
-                    "Anatomical Warp richiede un volto rilevabile nella foto: "
+                    "Anatomical Warp e Anatomical Destruction richiedono un volto "
+                    "rilevabile nella foto: "
                     "deforma solo i tratti del viso (occhi/naso/bocca/mascella), "
                     "non il corpo intero. Per una figura intera prova Voronoi "
                     "Fracture o Capillary Bleed. / Anatomical Warp requires a "
@@ -1933,6 +2155,14 @@ def main():
                         mode_score=mode_score, complexity_score=complexity_score,
                         smile_override=None if aw_auto_smile else float(aw_smile_manual),
                         desync_amount=float(aw_desync),
+                    )
+                elif style_key == STYLE_DESTRUCTION:
+                    render_anatomical_destruction(
+                        base_img, pts, env_bass, env_mid, env_high, beat_frames, int(seed),
+                        base_intensity=float(ad_intensity), growth_rate=float(ad_growth),
+                        writer=writer, mode_score=mode_score, complexity_score=complexity_score,
+                        enable_corrode=ad_corrode, enable_dislocate=ad_dislocate,
+                        enable_explode=ad_explode, enable_tear=ad_tear,
                     )
                 elif style_key == STYLE_VORONOI:
                     render_voronoi(
