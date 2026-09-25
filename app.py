@@ -2,6 +2,7 @@
 """BodyError // Loop507 - foto -> video di scomposizione anatomica, ancorata
 ai landmark del volto (dlib) e guidata da 3 bande audio (bassi/medi/alti)."""
 
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -13,7 +14,7 @@ import soundfile as sf
 import streamlit as st
 from scipy import ndimage
 from scipy.signal import find_peaks
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, Delaunay
 
 try:
     import librosa
@@ -166,20 +167,47 @@ _DLIB_DETECTOR = None
 _DLIB_PREDICTOR = None
 
 
+DLIB_MODEL_SHA1 = "73fde5e05226548677a050913eed4e04f39c6ff"
+
+
 def _ensure_dlib_model():
-    """Scarica e decomprime il modello dlib al primo utilizzo, se non gia' presente."""
-    if os.path.exists(DLIB_MODEL_PATH) and os.path.getsize(DLIB_MODEL_PATH) > 90_000_000:
-        return
+    """Scarica e decomprime il modello dlib al primo utilizzo, con verifica
+    del checksum e scrittura atomica: un file presente ma incompleto o
+    corrotto (download interrotto a meta') viene scartato e riscaricato
+    invece di restare silenziosamente "valido" per sempre, e il rename
+    atomico finale evita che una sessione concorrente legga un file a
+    meta' scritto."""
+    if os.path.exists(DLIB_MODEL_PATH):
+        with open(DLIB_MODEL_PATH, "rb") as f:
+            if hashlib.sha1(f.read()).hexdigest() == DLIB_MODEL_SHA1:
+                return
+        os.unlink(DLIB_MODEL_PATH)
+
     import bz2
     import urllib.request
 
-    compressed_path = DLIB_MODEL_PATH + ".bz2"
-    urllib.request.urlretrieve(DLIB_MODEL_URL, compressed_path)
-    with open(compressed_path, "rb") as f_in:
-        data = bz2.decompress(f_in.read())
-    with open(DLIB_MODEL_PATH, "wb") as f_out:
-        f_out.write(data)
-    os.unlink(compressed_path)
+    tmp_compressed = DLIB_MODEL_PATH + ".part.bz2"
+    tmp_final = DLIB_MODEL_PATH + ".part"
+
+    last_exc = None
+    for attempt in range(3):
+        try:
+            urllib.request.urlretrieve(DLIB_MODEL_URL, tmp_compressed)
+            with open(tmp_compressed, "rb") as f_in:
+                data = bz2.decompress(f_in.read())
+            if hashlib.sha1(data).hexdigest() != DLIB_MODEL_SHA1:
+                raise ValueError("checksum del modello non corrispondente")
+            with open(tmp_final, "wb") as f_out:
+                f_out.write(data)
+            os.replace(tmp_final, DLIB_MODEL_PATH)
+            return
+        except Exception as exc:
+            last_exc = exc
+            for p in (tmp_compressed, tmp_final):
+                if os.path.exists(p):
+                    os.unlink(p)
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"impossibile scaricare il modello dlib dopo 3 tentativi: {last_exc}")
 
 
 @st.cache_resource
@@ -379,27 +407,15 @@ def build_face_mesh_points(pts, shape):
 
 
 def get_delaunay_triangle_indices(rect, points):
-    """Triangolazione Delaunay -> lista di triple di INDICI (non coordinate)."""
-    subdiv = cv2.Subdiv2D(rect)
-    pts_list = [(float(p[0]), float(p[1])) for p in points]
-    for p in pts_list:
-        subdiv.insert(p)
-
-    coord_to_idx = {(round(p[0], 1), round(p[1], 1)): i for i, p in enumerate(pts_list)}
-    triangles_idx = []
-    for t in subdiv.getTriangleList():
-        # cast esplicito a float nativo Python: t arriva come numpy.float32,
-        # e round() su un numpy scalar resta un numpy scalar - confrontarlo
-        # con le chiavi (float nativo) del dizionario fallisce SEMPRE anche
-        # quando i valori "sembrano" uguali (precisione binaria diversa tra
-        # float32 e float64), azzerando silenziosamente tutti i triangoli.
-        tri_pts = [(float(t[0]), float(t[1])), (float(t[2]), float(t[3])),
-                   (float(t[4]), float(t[5]))]
-        idx = [coord_to_idx[(round(tp[0], 1), round(tp[1], 1))] for tp in tri_pts
-               if (round(tp[0], 1), round(tp[1], 1)) in coord_to_idx]
-        if len(idx) == 3:
-            triangles_idx.append(tuple(idx))
-    return triangles_idx
+    """Triangolazione Delaunay -> lista di triple di INDICI (non coordinate).
+    rect non serve piu': scipy.spatial.Delaunay lavora direttamente sugli
+    indici dei punti che gli passi (tri.simplices), senza dover recuperare
+    l'indice originale facendo il match delle coordinate restituite da
+    cv2.Subdiv2D. Elimina del tutto il rischio - gia' visto una volta - di
+    perdere triangoli per un mismatch di precisione float32/float64 tra le
+    coordinate arrotondate e quelle originali."""
+    tri = Delaunay(points)
+    return [tuple(int(i) for i in simplex) for simplex in tri.simplices]
 
 
 def warp_triangle(src_img, dst_img, t_src, t_dst):
@@ -444,6 +460,72 @@ def warp_face_mesh(base_img, all_src_pts, displaced_landmarks, hull_expanded, tr
         t_src = [tuple(all_src_pts[i]) for i in idx]
         t_dst = [tuple(all_dst_pts[i]) for i in idx]
         warp_triangle(base_img, output, t_src, t_dst)
+    return output
+
+
+def precompute_triangle_src_data(base_img, all_src_pts, triangles_idx):
+    """r1 (bounding rect), t1_rect e img1_rect dipendono SOLO da base_img e
+    all_src_pts, che restano fissi per tutto il render: ricalcolarli ad
+    ogni triangolo x ogni frame (come faceva warp_triangle) e' il costo
+    piu' ripetitivo del motore di warp. Calcolarli una volta sola qui,
+    prima del loop sui frame, e passarli a warp_triangle_fast."""
+    src_data = []
+    for idx in triangles_idx:
+        t_src = [tuple(all_src_pts[i]) for i in idx]
+        r1 = cv2.boundingRect(np.float32([t_src]))
+        if r1[2] <= 0 or r1[3] <= 0:
+            src_data.append(None)
+            continue
+        t1_rect = [(t_src[i][0] - r1[0], t_src[i][1] - r1[1]) for i in range(3)]
+        img1_rect = base_img[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]]
+        if img1_rect.size == 0:
+            src_data.append(None)
+            continue
+        src_data.append((t1_rect, img1_rect))
+    return src_data
+
+
+def warp_triangle_fast(dst_img, entry, t_dst):
+    """Come warp_triangle, ma la parte sorgente (t1_rect/img1_rect) arriva
+    gia' precalcolata da precompute_triangle_src_data: qui si ricalcola
+    solo il lato destinazione, che e' l'unico a cambiare frame per frame."""
+    if entry is None:
+        return
+    t1_rect, img1_rect = entry
+    h_img, w_img = dst_img.shape[:2]
+    r2 = cv2.boundingRect(np.float32([t_dst]))
+    x2, y2, w2, h2 = r2
+    x2c, y2c = max(x2, 0), max(y2, 0)
+    w2c = min(x2 + w2, w_img) - x2c
+    h2c = min(y2 + h2, h_img) - y2c
+    if r2[2] <= 0 or r2[3] <= 0 or w2c <= 0 or h2c <= 0:
+        return
+
+    t2_rect = [(t_dst[i][0] - r2[0], t_dst[i][1] - r2[1]) for i in range(3)]
+    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
+    cv2.fillConvexPoly(mask, np.int32(t2_rect), (1.0, 1.0, 1.0), cv2.LINE_AA)
+
+    warp_mat = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
+    img2_rect = cv2.warpAffine(img1_rect, warp_mat, (r2[2], r2[3]), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REFLECT_101)
+    img2_rect = img2_rect * mask
+
+    oy0, ox0 = y2c - r2[1], x2c - r2[0]
+    img2_rect_c = img2_rect[oy0:oy0 + h2c, ox0:ox0 + w2c]
+    mask_c = mask[oy0:oy0 + h2c, ox0:ox0 + w2c]
+
+    dst_slice = dst_img[y2c:y2c + h2c, x2c:x2c + w2c]
+    dst_slice[:] = dst_slice * (1 - mask_c) + img2_rect_c
+
+
+def warp_face_mesh_fast(base_img, src_data, displaced_landmarks, hull_expanded, triangles_idx):
+    """Equivalente a warp_face_mesh ma usa il lato sorgente precalcolato
+    (src_data), da richiamare dentro il loop sui frame."""
+    all_dst_pts = np.concatenate([displaced_landmarks, hull_expanded], axis=0).astype(np.float32)
+    output = base_img.copy()
+    for idx, entry in zip(triangles_idx, src_data):
+        t_dst = [tuple(all_dst_pts[i]) for i in idx]
+        warp_triangle_fast(output, entry, t_dst)
     return output
 
 
@@ -638,6 +720,7 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
     all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
     h, w = base_img.shape[:2]
     triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+    src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
 
     eye_r_center = tuple(pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0))
     eye_l_center = tuple(pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0))
@@ -692,7 +775,7 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         for i in LANDMARK_GROUPS["jaw"][9:]:
             displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_r
 
-        frame = warp_face_mesh(base_img, all_src_pts, displaced, hull_expanded, triangles_idx)
+        frame = warp_face_mesh_fast(base_img, src_data, displaced, hull_expanded, triangles_idx)
 
         # dilatazione radiale vera (lente d'ingrandimento), non solo
         # spostamento di landmark: occhi simmetrici pilotati dagli alti,
@@ -1272,6 +1355,7 @@ def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
     if has_face:
         all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
         triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+        src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
         eye_r_center = tuple(pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0))
         eye_l_center = tuple(pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0))
         eye_width = float(np.linalg.norm(pts[36] - pts[39]))
@@ -1355,7 +1439,7 @@ def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
             for i in LANDMARK_GROUPS["jaw"][9:]:
                 displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_r
 
-            frame = warp_face_mesh(frame, all_src_pts, displaced, hull_expanded, triangles_idx)
+            frame = warp_face_mesh_fast(frame, src_data, displaced, hull_expanded, triangles_idx)
 
             eye_bulge = float(np.clip(0.25 + eye_i * 0.9, 0.0, 0.9))
             frame = apply_bulge_roi(frame, eye_r_center, eye_radius, eye_bulge)
