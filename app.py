@@ -704,18 +704,25 @@ def criminisi_inpaint(image, mask, patch_size=9, search_margin=40, search_step=2
     return img
 
 
-def dislocate_feature(frame, hull_mask, offset, hole_fill="inpaint"):
+def dislocate_feature(frame, hull_mask, offset, hole_fill="inpaint", precomputed_fill=None):
     """Stacca fisicamente la regione (occhio/bocca) e la trasla, lasciando
     un buco vero al posto originale - non e' un warp che tira la mesh,
     e' un pezzo che se ne va e non torna. offset e' un vettore (dx, dy)
     che deve crescere in modo monotono nel tempo (mai in discesa) perche'
     il danno resti permanente. hole_fill: 'inpaint' (cv2, rapido, sfuma),
     'criminisi' (sintesi di texture vera, molto piu' lento) o altro
-    valore per un buco nero secco."""
+    valore per un buco nero secco. precomputed_fill: se fornito (un
+    riempimento gia' calcolato UNA VOLTA, es. con criminisi_inpaint sulla
+    base_img prima del loop sui frame), lo si usa direttamente invece di
+    richiamare hole_fill ad ogni frame - indispensabile per criminisi, che
+    da solo costa secondi per frame; il buco e' nella stessa posizione per
+    tutto il render, quindi ricalcolarlo ogni volta e' puro spreco."""
     h, w = frame.shape[:2]
     dx, dy = int(round(offset[0])), int(round(offset[1]))
 
-    if hole_fill == "inpaint":
+    if precomputed_fill is not None:
+        base = precomputed_fill
+    elif hole_fill == "inpaint":
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         filled = cv2.inpaint(frame_u8, hull_mask, 5, cv2.INPAINT_TELEA)
         base = filled.astype(np.float32) / 255.0
@@ -1106,6 +1113,17 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
     eye_r_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_r"])
     eye_l_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_l"])
     nose_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["nose"])
+    nose_fill_cache = None
+    if enable_dislocate and hole_fill == "criminisi":
+        # il buco e' sempre nella stessa posizione per tutto il render (la
+        # maschera non cambia frame per frame): calcolare qui, una sola
+        # volta sulla base_img originale, invece che ad ogni frame dentro
+        # dislocate_feature, e' la differenza tra qualche secondo e ore di
+        # render. Costo: il riempimento non segue le variazioni introdotte
+        # dal warp/dalla corrosione occhi nei frame successivi - un
+        # compromesso ragionevole per un buco piccolo, in un effetto che
+        # e' comunque pensato per essere vistosamente "rotto".
+        nose_fill_cache = criminisi_inpaint(base_img, nose_mask)
     mouth_center = pts[LANDMARK_GROUPS["mouth"]].mean(axis=0)
     mouth_bbox = cv2.boundingRect(pts[LANDMARK_GROUPS["jaw"]].astype(np.int32))
 
@@ -1169,7 +1187,8 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
         if enable_dislocate and growth_acc >= thr_nose:
             nose_offset = ((growth_acc - thr_nose) / max(1.0 - thr_nose, 1e-6)) * np.array(
                 [10.0, 40.0]) * base_intensity + np.array([em * 4.0, 0.0])
-            frame = dislocate_feature(frame, nose_mask, nose_offset, hole_fill=hole_fill)
+            frame = dislocate_feature(frame, nose_mask, nose_offset, hole_fill=hole_fill,
+                                       precomputed_fill=nose_fill_cache)
 
         # 4) strappo a strisce sulla meta' inferiore del volto: come le
         # celle Voronoi, ogni striscia accumula tensione in base alla
@@ -2251,12 +2270,20 @@ def main():
             "Riempimento buco dislocazione / Dislocation hole fill",
             ["inpaint", "criminisi"], index=0, key="ad_hole_fill",
             help="'inpaint' (cv2, rapido, tende a sfumare) o 'criminisi' "
-                 "(sintesi di texture vera, Criminisi et al. 2004 - molto "
-                 "piu' lenta: qualche secondo PER FRAME, adatta a preview "
-                 "corte, non a render lunghi). / 'inpaint' (cv2, fast, "
-                 "tends to blur) or 'criminisi' (real texture synthesis - "
-                 "much slower: seconds PER FRAME, fine for short previews, "
-                 "not long renders).",
+                 "(sintesi di texture vera, Criminisi et al. 2004). "
+                 "Criminisi viene calcolato UNA SOLA VOLTA prima del render "
+                 "(qualche secondo di attesa iniziale), non ad ogni frame: "
+                 "il buco resta nella stessa posizione per tutto il video, "
+                 "quindi non segue le variazioni introdotte dal warp/dalla "
+                 "corrosione occhi nei frame successivi - compromesso "
+                 "ragionevole per un effetto pensato per essere vistosamente "
+                 "\"rotto\". / 'inpaint' (cv2, fast, tends to blur) or "
+                 "'criminisi' (real texture synthesis). Criminisi is "
+                 "computed ONCE before rendering (a few seconds' initial "
+                 "wait), not per frame: the hole stays in the same spot for "
+                 "the whole video, so it won't track changes from the warp/"
+                 "eye corrosion in later frames - a reasonable trade-off "
+                 "for an effect meant to look visibly \"broken\" anyway.",
         )
     with st.expander("Voronoi Fracture",
                       expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
