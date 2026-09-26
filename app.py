@@ -531,6 +531,78 @@ def warp_face_mesh_fast(base_img, src_data, displaced_landmarks, hull_expanded, 
     return output
 
 
+# ---------------------------------------------------------------------------
+# MOTORE DI WARP ALTERNATIVO: MOVING LEAST SQUARES (MLS)
+# Schaefer, McPhail, Warren - "Image Deformation Using Moving Least
+# Squares" (ACM TOG / SIGGRAPH 2006). Nessuna triangolazione: ogni punto
+# dell'immagine ha una trasformazione affine locale, pesata per distanza
+# inversa dai control point - elimina le cuciture visibili ai bordi dei
+# triangoli che il motore Delaunay puo' mostrare con deformazioni forti.
+# ---------------------------------------------------------------------------
+
+def build_mls_deformation_field(control_src, control_dst, img_shape, grid_size=64,
+                                 alpha=1.0, eps=1e-6):
+    """Calcola una mappa di deformazione (map_x, map_y) via MLS affine su
+    una griglia grezza, poi la ricampiona a piena risoluzione - stessa
+    tecnica (campo a bassa risoluzione + resize) che apply_bulge_roi usa
+    per la singola lente radiale, qui applicata all'intero warp del
+    volto. control_src/control_dst sono in coordinate pixel piene."""
+    h, w = img_shape[:2]
+    gh = max(int(round(grid_size * h / max(w, h))), 8)
+    gw = max(int(round(grid_size * w / max(w, h))), 8)
+    sx, sy = w / gw, h / gh
+
+    yy, xx = np.mgrid[0:gh, 0:gw].astype(np.float32)
+    grid_pts = np.stack([xx.ravel() * sx, yy.ravel() * sy], axis=1)  # (m, 2)
+
+    diff = grid_pts[:, None, :] - control_src[None, :, :]  # (m, n, 2)
+    dist2 = np.sum(diff ** 2, axis=2) + eps
+    weight = 1.0 / dist2 ** alpha  # (m, n)
+    wsum = weight.sum(axis=1, keepdims=True)
+
+    p_star = (weight[:, :, None] * control_src[None, :, :]).sum(axis=1) / wsum
+    q_star = (weight[:, :, None] * control_dst[None, :, :]).sum(axis=1) / wsum
+
+    p_hat = control_src[None, :, :] - p_star[:, None, :]  # (m, n, 2)
+    q_hat = control_dst[None, :, :] - q_star[:, None, :]  # (m, n, 2)
+
+    # M minimizza sum_i w_i |p_hat_i M - q_hat_i|^2 -> soluzione in forma
+    # chiusa A @ M = Bm, con A e Bm matrici 2x2 diverse per ogni punto
+    # della griglia (una trasformazione affine locale per punto).
+    A = np.einsum('mn,mni,mnj->mij', weight, p_hat, p_hat)
+    Bm = np.einsum('mn,mni,mnj->mij', weight, p_hat, q_hat)
+    A += np.eye(2, dtype=np.float32)[None, :, :] * eps  # regolarizzazione anti-singolare
+
+    M = np.linalg.solve(A, Bm)
+
+    v_hat = grid_pts - p_star
+    f_v = np.einsum('mi,mij->mj', v_hat, M) + q_star  # (m, 2)
+
+    map_x_small = f_v[:, 0].reshape(gh, gw)
+    map_y_small = f_v[:, 1].reshape(gh, gw)
+    map_x = cv2.resize(map_x_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    map_y = cv2.resize(map_y_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    return map_x.astype(np.float32), map_y.astype(np.float32)
+
+
+def warp_face_mls(base_img, all_src_pts, displaced_landmarks, hull_expanded, grid_size=64):
+    """Alternativa a warp_face_mesh_fast: stesso identico ruolo (deforma
+    base_img secondo lo spostamento dei landmark), ma via MLS invece che
+    Delaunay+affine per triangolo. Nota sulla direzione: per cv2.remap
+    serve la mappa INVERSA (per ogni pixel di destinazione, da dove
+    campionare nella sorgente), quindi i control point vanno passati
+    invertiti: 'source' del campo MLS = posizioni DESTINAZIONE di questo
+    frame, 'destination' del campo MLS = posizioni ORIGINALI fisse."""
+    all_dst_pts = np.concatenate([displaced_landmarks, hull_expanded], axis=0).astype(np.float32)
+    h, w = base_img.shape[:2]
+    map_x, map_y = build_mls_deformation_field(all_dst_pts, all_src_pts, (h, w),
+                                                grid_size=grid_size)
+    map_x = np.clip(map_x, 0, w - 1)
+    map_y = np.clip(map_y, 0, h - 1)
+    return cv2.remap(base_img, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_REFLECT_101)
+
+
 def _group_hull_mask(shape, pts, group_idx, dilate_px=6):
     """Maschera binaria (uint8, 0/255) del convex hull di un gruppo di
     landmark, con un margine di dilatazione per non lasciare un bordo
@@ -544,12 +616,102 @@ def _group_hull_mask(shape, pts, group_idx, dilate_px=6):
     return mask
 
 
+def criminisi_inpaint(image, mask, patch_size=9, search_margin=40, search_step=2):
+    """Inpainting exemplar-based (Criminisi, Perez, Toyama - 'Region
+    Filling and Object Removal by Exemplar-Based Image Inpainting', IEEE
+    Trans. Image Processing, 2004). A differenza di cv2.inpaint (diffusione
+    PDE, sfoca invece di riprodurre texture), qui:
+    1) si calcola una PRIORITA' per ogni pixel di bordo del buco = confidenza
+       (quanta area valida lo circonda) x forza dell'isofota (bordi/contorni
+       hanno priorita' piu' alta, cosi' le linee non si interrompono);
+    2) si riempie prima il pixel a priorita' massima, copiandovi la patch
+       sorgente piu' simile (SSD) trovata FUORI dal buco;
+    3) si aggiorna la confidenza e si ripete finche' il buco non e' pieno.
+    Limitato a una finestra locale (search_margin) attorno al buco e con
+    ricerca sotto-campionata (search_step): resta piu' lento di cv2.inpaint
+    ma utilizzabile su buchi piccoli (es. il naso dislocato), non su
+    un'immagine intera ad ogni frame."""
+    img = image.copy().astype(np.float32)
+    h, w = img.shape[:2]
+    target = mask > 0
+    if not target.any():
+        return img
+
+    ys, xs = np.where(target)
+    y0 = max(int(ys.min()) - search_margin, 0)
+    y1 = min(int(ys.max()) + search_margin, h)
+    x0 = max(int(xs.min()) - search_margin, 0)
+    x1 = min(int(xs.max()) + search_margin, w)
+
+    region = img[y0:y1, x0:x1].copy()
+    region_mask = target[y0:y1, x0:x1].copy()
+    confidence = (~region_mask).astype(np.float32)
+    half = patch_size // 2
+    kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=np.uint8)
+
+    max_iters = int(region_mask.sum()) + 5
+    for _ in range(max_iters):
+        if not region_mask.any():
+            break
+        boundary = (cv2.filter2D(region_mask.astype(np.uint8), -1, kernel) > 0) & region_mask
+        if not boundary.any():
+            break
+
+        gray = cv2.cvtColor((np.clip(region, 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        gy, gx = np.gradient(gray.astype(np.float32))
+        by, bx = np.where(boundary)
+
+        conf_term = np.empty(len(by), dtype=np.float32)
+        data_term = np.empty(len(by), dtype=np.float32)
+        for k in range(len(by)):
+            py, px = by[k], bx[k]
+            y_lo, y_hi = max(py - half, 0), min(py + half + 1, region.shape[0])
+            x_lo, x_hi = max(px - half, 0), min(px + half + 1, region.shape[1])
+            patch_conf = confidence[y_lo:y_hi, x_lo:x_hi]
+            conf_term[k] = patch_conf.sum() / patch_conf.size
+            data_term[k] = abs(gx[py, px]) + abs(gy[py, px]) + 0.05
+
+        best = int(np.argmax(conf_term * data_term))
+        py, px = by[best], bx[best]
+        y_lo, y_hi = max(py - half, 0), min(py + half + 1, region.shape[0])
+        x_lo, x_hi = max(px - half, 0), min(px + half + 1, region.shape[1])
+        target_patch = region[y_lo:y_hi, x_lo:x_hi]
+        target_mask_patch = region_mask[y_lo:y_hi, x_lo:x_hi]
+        ph, pw = target_patch.shape[:2]
+
+        best_ssd, best_src = None, None
+        for sy in range(0, max(region.shape[0] - ph, 1), search_step):
+            for sx in range(0, max(region.shape[1] - pw, 1), search_step):
+                if region_mask[sy:sy + ph, sx:sx + pw].any():
+                    continue
+                cand = region[sy:sy + ph, sx:sx + pw]
+                valid = ~target_mask_patch
+                if not valid.any():
+                    continue
+                ssd = float(np.sum((cand[valid] - target_patch[valid]) ** 2))
+                if best_ssd is None or ssd < best_ssd:
+                    best_ssd, best_src = ssd, cand.copy()
+
+        if best_src is not None:
+            fill = target_mask_patch
+            target_patch[fill] = best_src[fill]
+            confidence[y_lo:y_hi, x_lo:x_hi][fill] = conf_term[best]
+            region_mask[y_lo:y_hi, x_lo:x_hi][fill] = False
+        else:
+            region_mask[py, px] = False  # nessuna patch valida: evita il loop infinito
+
+    img[y0:y1, x0:x1] = region
+    return img
+
+
 def dislocate_feature(frame, hull_mask, offset, hole_fill="inpaint"):
     """Stacca fisicamente la regione (occhio/bocca) e la trasla, lasciando
     un buco vero al posto originale - non e' un warp che tira la mesh,
     e' un pezzo che se ne va e non torna. offset e' un vettore (dx, dy)
     che deve crescere in modo monotono nel tempo (mai in discesa) perche'
-    il danno resti permanente."""
+    il danno resti permanente. hole_fill: 'inpaint' (cv2, rapido, sfuma),
+    'criminisi' (sintesi di texture vera, molto piu' lento) o altro
+    valore per un buco nero secco."""
     h, w = frame.shape[:2]
     dx, dy = int(round(offset[0])), int(round(offset[1]))
 
@@ -557,6 +719,8 @@ def dislocate_feature(frame, hull_mask, offset, hole_fill="inpaint"):
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         filled = cv2.inpaint(frame_u8, hull_mask, 5, cv2.INPAINT_TELEA)
         base = filled.astype(np.float32) / 255.0
+    elif hole_fill == "criminisi":
+        base = criminisi_inpaint(frame, hull_mask)
     else:
         base = frame.copy()
         base[hull_mask > 0] = 0.0
@@ -792,7 +956,7 @@ def apply_directional_stretch(img, center, radius, stretch_x, stretch_y, work_sc
 def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_frames,
                             seed, base_intensity, w_bass, w_mid, w_high, growth_rate,
                             writer, mode_score=0.0, complexity_score=0.5,
-                            smile_override=None, desync_amount=0.0):
+                            smile_override=None, desync_amount=0.0, use_mls=False):
     """Deforma il volto su una mesh triangolata (Delaunay) ancorata ai landmark,
     piu' dilatazione radiale (bulge) su occhi e viso intero e uno stretch
     direzionale legato al carattere del brano:
@@ -809,14 +973,19 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
       ANTICIPO rispetto agli alti (innaturale, come se "prevedessero" il
       suono) - un classico del body horror: parti del corpo scollegate tra
       loro nel tempo, non solo nello spazio
+    - use_mls: se True usa il motore Moving Least Squares (niente
+      triangolazione, niente cuciture visibili) invece di Delaunay+affine
+      per triangolo. Piu' lento della sola triangolazione, ma piu' pulito
+      con deformazioni forti.
     Le tre bande hanno un carattere qualitativamente diverso, non solo
     un'intensita' diversa: bassi = colpo secco sulla mascella, medi = bocca
     che scatta aperta/chiusa a soglia, alti = tremore rapido sugli occhi."""
     rng = np.random.default_rng(seed)
     all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
     h, w = base_img.shape[:2]
-    triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
-    src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
+    if not use_mls:
+        triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+        src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
 
     eye_r_center = tuple(pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0))
     eye_l_center = tuple(pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0))
@@ -871,7 +1040,10 @@ def render_anatomical_warp(base_img, pts, env_bass, env_mid, env_high, beat_fram
         for i in LANDMARK_GROUPS["jaw"][9:]:
             displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_r
 
-        frame = warp_face_mesh_fast(base_img, src_data, displaced, hull_expanded, triangles_idx)
+        if use_mls:
+            frame = warp_face_mls(base_img, all_src_pts, displaced, hull_expanded)
+        else:
+            frame = warp_face_mesh_fast(base_img, src_data, displaced, hull_expanded, triangles_idx)
 
         # dilatazione radiale vera (lente d'ingrandimento), non solo
         # spostamento di landmark: occhi simmetrici pilotati dagli alti,
@@ -908,7 +1080,8 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                                    seed, base_intensity, growth_rate, writer,
                                    mode_score=0.0, complexity_score=0.5,
                                    enable_corrode=True, enable_dislocate=True,
-                                   enable_explode=True, enable_tear=True):
+                                   enable_explode=True, enable_tear=True, use_mls=False,
+                                   hole_fill="inpaint"):
     """Stessa mesh anatomica di Anatomical Warp come base, ma superate
     soglie crescenti di energia accumulata (growth_acc, monotona) le
     feature vengono DANNEGGIATE in modo permanente invece di deformate
@@ -926,8 +1099,9 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
     rng = np.random.default_rng(seed)
     h, w = base_img.shape[:2]
     all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
-    triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
-    src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
+    if not use_mls:
+        triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+        src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
 
     eye_r_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_r"])
     eye_l_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_l"])
@@ -963,7 +1137,10 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                 displaced[LANDMARK_GROUPS["mouth"]] += rng.uniform(-6, 6, (
                     len(LANDMARK_GROUPS["mouth"]), 2)) * eb
 
-        frame = warp_face_mesh_fast(frame_src, src_data, displaced, hull_expanded, triangles_idx)
+        if use_mls:
+            frame = warp_face_mls(frame_src, all_src_pts, displaced, hull_expanded)
+        else:
+            frame = warp_face_mesh_fast(frame_src, src_data, displaced, hull_expanded, triangles_idx)
 
         # 2) corrosione occhi: guidata dagli alti, soglia piu' bassa
         if enable_corrode and growth_acc >= thr_eye:
@@ -977,7 +1154,7 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
         if enable_dislocate and growth_acc >= thr_nose:
             nose_offset = ((growth_acc - thr_nose) / max(1.0 - thr_nose, 1e-6)) * np.array(
                 [10.0, 40.0]) * base_intensity + np.array([em * 4.0, 0.0])
-            frame = dislocate_feature(frame, nose_mask, nose_offset, hole_fill="inpaint")
+            frame = dislocate_feature(frame, nose_mask, nose_offset, hole_fill=hole_fill)
 
         # 4) strappo a strisce sulla meta' inferiore del volto: solo a
         # collasso quasi completo, resta attivo una volta innescato
@@ -1043,34 +1220,42 @@ def compute_voronoi_cells(img, region_mask, n_points, rng):
 
 
 def apply_voronoi_displacement(img, points, labels, boxes, intensity, rng, mode_score=0.0,
-                                complexity_score=0.5):
+                                complexity_score=0.5, disp_override=None):
     """Parte economica (solo spostamento delle celle gia' segmentate): questa
     si ricalcola ad ogni frame perche' l'intensita' cambia con l'audio.
     mode_score: minore = i pezzi cadono di piu' (droop), maggiore = si
     spingono di piu' verso l'esterno (radiale/esplosivo). complexity_score
     scala il rumore casuale per pezzo, per un caos maggiore su brani densi.
     Usa i riquadri (boxes) precalcolati una volta in compute_voronoi_cells,
-    invece di scansionare l'intera immagine per ogni cella ad ogni frame."""
+    invece di scansionare l'intera immagine per ogni cella ad ogni frame.
+    disp_override: se fornito (disp_x, disp_y) precalcolati altrove (es.
+    dal modello fisico in render_voronoi), sostituisce la formula di
+    spostamento diretto qui sotto - stesso rendering delle celle, diversa
+    origine dello spostamento."""
     h, w = img.shape[:2]
     n_cells = len(points)
-    cx = points[:, 0].mean()
-    cy = points[:, 1].mean()
 
-    fall_bias = 0.7 + max(-mode_score, 0.0) * 0.6
-    radial_bias = 1.2 + max(mode_score, 0.0) * 0.7
-    jitter_scale = 0.5 + complexity_score
+    if disp_override is not None:
+        disp_x, disp_y = disp_override
+    else:
+        cx = points[:, 0].mean()
+        cy = points[:, 1].mean()
 
-    disp_x = np.zeros(n_cells, dtype=np.float32)
-    disp_y = np.zeros(n_cells, dtype=np.float32)
-    for i, (px, py) in enumerate(points):
-        dx, dy = px - cx, py - cy
-        dist = np.sqrt(dx * dx + dy * dy) + 1e-6
-        push = (dist / max(w, h)) * radial_bias
-        disp_x[i] = (dx / dist) * push * intensity * 45
-        disp_y[i] = (dy / dist) * push * intensity * 45 + fall_bias * intensity * 30
+        fall_bias = 0.7 + max(-mode_score, 0.0) * 0.6
+        radial_bias = 1.2 + max(mode_score, 0.0) * 0.7
+        jitter_scale = 0.5 + complexity_score
 
-    disp_x += rng.uniform(-6, 6, n_cells) * intensity * jitter_scale
-    disp_y += rng.uniform(-3, 10, n_cells) * intensity * jitter_scale
+        disp_x = np.zeros(n_cells, dtype=np.float32)
+        disp_y = np.zeros(n_cells, dtype=np.float32)
+        for i, (px, py) in enumerate(points):
+            dx, dy = px - cx, py - cy
+            dist = np.sqrt(dx * dx + dy * dy) + 1e-6
+            push = (dist / max(w, h)) * radial_bias
+            disp_x[i] = (dx / dist) * push * intensity * 45
+            disp_y[i] = (dy / dist) * push * intensity * 45 + fall_bias * intensity * 30
+
+        disp_x += rng.uniform(-6, 6, n_cells) * intensity * jitter_scale
+        disp_y += rng.uniform(-3, 10, n_cells) * intensity * jitter_scale
 
     # base "tessuto sotto la crepa": la foto stessa leggermente ammorbidita,
     # NON annerita - cosi' dove una placca si sposta si vede ancora il volto
@@ -1125,16 +1310,45 @@ def apply_voronoi_displacement(img, points, labels, boxes, intensity, rng, mode_
 
 def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
                     seed, base_intensity, n_points, growth_rate, writer,
-                    mode_score=0.0, complexity_score=0.5):
+                    mode_score=0.0, complexity_score=0.5, use_physics=False,
+                    break_threshold=0.4, damping=0.90):
     """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM).
     I punti/celle Voronoi si ricalcolano solo ai beat (costoso), non ogni
-    frame (economico): stesso identico risultato visivo, molto meno CPU."""
+    frame (economico): stesso identico risultato visivo, molto meno CPU.
+
+    use_physics ispira il modello di Smith, Witkin e Baraff, "Fast and
+    Controllable Simulation of the Shattering of Brittle Objects" (2001):
+    nel paper, forze vincolari calcolate con moltiplicatori di Lagrange
+    decidono QUANDO e DOVE l'oggetto si rompe, e assegnano la velocita'
+    iniziale ai frammenti. Qui, senza un vero solver di vincoli, si
+    approssima con:
+    - ogni cella accumula una "tensione" (strain) ad ogni colpo, tanto
+      maggiore quanto piu' e' vicina all'epicentro dell'impatto;
+    - finche' la tensione non supera break_threshold la cella resta
+      RIGIDA (ferma, come un oggetto intatto), non si limita a spostarsi
+      un po' meno delle altre come nella versione originale;
+    - superata la soglia, la cella si "rompe" in modo permanente (mai piu'
+      rigida) e da quel momento accumula VELOCITA' vera (non uno
+      spostamento ricalcolato da zero ogni frame): l'inerzia la porta
+      avanti anche se l'impulso che l'ha spezzata e' finito, con un
+      leggero damping invece di un arresto istantaneo.
+    Se use_physics=False, comportamento identico alla versione originale
+    (spostamento diretto dalla formula, nessuno stato tra i frame)."""
     total_frames = len(env_bass)
     growth_acc = 0.0
     seed_offset = 0
 
     cache_rng = np.random.default_rng(seed)
     points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+
+    def _reset_physics_state(n_cells):
+        return (np.zeros((n_cells, 2), dtype=np.float32),  # vel
+                np.zeros(n_cells, dtype=np.float32),        # strain
+                np.zeros(n_cells, dtype=bool),              # broken
+                np.zeros((n_cells, 2), dtype=np.float32))   # pos_offset
+
+    if use_physics:
+        vel, strain, broken, pos_offset = _reset_physics_state(len(points))
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -1145,6 +1359,8 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             seed_offset += 1
             cache_rng = np.random.default_rng(seed + seed_offset)
             points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+            if use_physics:
+                vel, strain, broken, pos_offset = _reset_physics_state(len(points))
 
         # bassi: intensita' della frattura, con colpo secco sul beat
         intensity = 0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)
@@ -1152,9 +1368,46 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             intensity *= 1.7
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
-        frame = apply_voronoi_displacement(base_img, points, labels, boxes, intensity, disp_rng,
-                                            mode_score=mode_score,
-                                            complexity_score=complexity_score)
+
+        if use_physics:
+            cx, cy = points[:, 0].mean(), points[:, 1].mean()
+            fall_bias = 0.7 + max(-mode_score, 0.0) * 0.6
+            impact_force = eb * base_intensity * 260.0
+            if f in beat_frames:
+                impact_force *= 2.2
+
+            dx = points[:, 0] - cx
+            dy = points[:, 1] - cy
+            dist = np.sqrt(dx * dx + dy * dy) + 1.0
+            dirx, diry = dx / dist, dy / dist
+
+            local_force = impact_force / dist  # come una forza vincolare che
+                                                # decade con la distanza dal
+                                                # punto d'impatto (qui: il
+                                                # centro delle celle)
+            strain += local_force
+            newly_broken = (~broken) & (strain > break_threshold * 120.0)
+            broken |= newly_broken
+
+            active = broken
+            vel[active, 0] = vel[active, 0] * damping + dirx[active] * local_force[active] * 0.06
+            vel[active, 1] = (vel[active, 1] * damping + diry[active] * local_force[active] * 0.06
+                               + fall_bias * 0.12)
+            pos_offset[active] += vel[active]
+            # rumore piccolo anche sulle celle rotte, scalato dalla densita' del brano
+            pos_offset[active] += disp_rng.uniform(-1.5, 1.5, (int(active.sum()), 2)) * \
+                                   (0.5 + complexity_score)
+
+            disp_override = (pos_offset[:, 0], pos_offset[:, 1])
+            frame = apply_voronoi_displacement(base_img, points, labels, boxes, intensity,
+                                                disp_rng, mode_score=mode_score,
+                                                complexity_score=complexity_score,
+                                                disp_override=disp_override)
+        else:
+            frame = apply_voronoi_displacement(base_img, points, labels, boxes, intensity,
+                                                disp_rng, mode_score=mode_score,
+                                                complexity_score=complexity_score)
+
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         writer.write(frame_u8)
@@ -1919,6 +2172,15 @@ def main():
                  "tempo. / Mouth lags, eyes anticipate: facial parts fall "
                  "out of sync with each other. 0 = everything on time.",
         )
+        aw_use_mls = st.checkbox(
+            "Motore MLS (niente cuciture, piu' lento) / MLS engine "
+            "(no seams, slower)",
+            value=False, key="aw_use_mls",
+            help="Sostituisce la triangolazione Delaunay con Moving Least "
+                 "Squares (Schaefer et al. 2006): elimina le cuciture "
+                 "visibili ai bordi dei triangoli con deformazioni forti, "
+                 "a costo di un render piu' lento.",
+        )
     with st.expander("Anatomical Destruction",
                       expanded=(style_key == STYLE_DESTRUCTION)):
         st.caption(
@@ -1944,6 +2206,22 @@ def main():
                                       key="ad_explode")
             ad_tear = st.checkbox("Strappo a strisce / Strip tear", value=True,
                                    key="ad_tear")
+        ad_use_mls = st.checkbox(
+            "Motore MLS (niente cuciture, piu' lento) / MLS engine "
+            "(no seams, slower)",
+            value=False, key="ad_use_mls",
+        )
+        ad_hole_fill = st.selectbox(
+            "Riempimento buco dislocazione / Dislocation hole fill",
+            ["inpaint", "criminisi"], index=0, key="ad_hole_fill",
+            help="'inpaint' (cv2, rapido, tende a sfumare) o 'criminisi' "
+                 "(sintesi di texture vera, Criminisi et al. 2004 - molto "
+                 "piu' lenta: qualche secondo PER FRAME, adatta a preview "
+                 "corte, non a render lunghi). / 'inpaint' (cv2, fast, "
+                 "tends to blur) or 'criminisi' (real texture synthesis - "
+                 "much slower: seconds PER FRAME, fine for short previews, "
+                 "not long renders).",
+        )
     with st.expander("Voronoi Fracture",
                       expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
         if style_key == STYLE_COMBO:
@@ -1955,6 +2233,24 @@ def main():
                                key="vf_points")
         vf_growth = st.slider("Velocita' progressione / Growth rate", 0.5, 5.0, 2.0, 0.5,
                                key="vf_growth")
+        vf_use_physics = st.checkbox(
+            "Fisica d'impatto (Smith-Witkin-Baraff) / Impact physics",
+            value=False, key="vf_use_physics",
+            help="Le celle restano rigide (ferme) finche' la tensione "
+                 "accumulata dai colpi non supera una soglia; una volta "
+                 "rotte accumulano velocita' vera con inerzia, invece di "
+                 "ricalcolare lo spostamento da zero ad ogni frame. Solo "
+                 "per Voronoi Fracture da solo, non nel combo con "
+                 "Capillary. / Cells stay rigid until accumulated impact "
+                 "strain crosses a threshold; once broken they gain real "
+                 "velocity with inertia instead of a from-scratch "
+                 "displacement each frame. Voronoi Fracture alone only, "
+                 "not in the Capillary combo.",
+        )
+        vf_break_threshold = st.slider(
+            "Soglia di rottura / Break threshold", 0.1, 1.0, 0.4, 0.05,
+            key="vf_break_threshold", disabled=not vf_use_physics,
+        )
     with st.expander("Capillary Bleed", expanded=(style_key == STYLE_CAPILLARY)):
         cb_intensity = st.slider("Intensita' venature / Vein intensity", 0.2, 3.0, 1.0, 0.1,
                                   key="cb_intensity")
@@ -2154,7 +2450,7 @@ def main():
                         growth_rate=float(aw_growth), writer=writer,
                         mode_score=mode_score, complexity_score=complexity_score,
                         smile_override=None if aw_auto_smile else float(aw_smile_manual),
-                        desync_amount=float(aw_desync),
+                        desync_amount=float(aw_desync), use_mls=bool(aw_use_mls),
                     )
                 elif style_key == STYLE_DESTRUCTION:
                     render_anatomical_destruction(
@@ -2162,7 +2458,8 @@ def main():
                         base_intensity=float(ad_intensity), growth_rate=float(ad_growth),
                         writer=writer, mode_score=mode_score, complexity_score=complexity_score,
                         enable_corrode=ad_corrode, enable_dislocate=ad_dislocate,
-                        enable_explode=ad_explode, enable_tear=ad_tear,
+                        enable_explode=ad_explode, enable_tear=ad_tear, use_mls=bool(ad_use_mls),
+                        hole_fill=ad_hole_fill,
                     )
                 elif style_key == STYLE_VORONOI:
                     render_voronoi(
@@ -2170,6 +2467,8 @@ def main():
                         int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
                         n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
                         mode_score=mode_score, complexity_score=complexity_score,
+                        use_physics=bool(vf_use_physics),
+                        break_threshold=float(vf_break_threshold),
                     )
                 elif style_key == STYLE_CAPILLARY:
                     render_capillary_bleed(
