@@ -1113,6 +1113,21 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
     # inferiore del volto si strappa solo a collasso quasi completo
     thr_eye, thr_nose, thr_mouth, thr_tear = 0.15, 0.35, 0.55, 0.8
 
+    # stato fisico per lo strappo a strisce, ispirato a Smith, Witkin e
+    # Baraff (2001) come per il Voronoi: ogni striscia e' come un frammento
+    # che resta rigido (fermo) finche' la tensione accumulata non supera
+    # una soglia, poi si rompe UNA VOLTA per sempre e da quel momento
+    # accumula velocita' vera con inerzia. Prima di questo fix, la
+    # direzione di ogni striscia veniva ri-sorteggiata ad ogni frame
+    # (rng.uniform dentro il loop): il "danno" poteva letteralmente
+    # cambiare direzione frame per frame invece di restare permanente.
+    n_tear_strips = 6
+    tear_dir = rng.choice([-1.0, 1.0], size=n_tear_strips).astype(np.float32)
+    tear_vel = np.zeros(n_tear_strips, dtype=np.float32)
+    tear_strain = np.zeros(n_tear_strips, dtype=np.float32)
+    tear_broken = np.zeros(n_tear_strips, dtype=bool)
+    tear_offset = np.zeros(n_tear_strips, dtype=np.float32)
+
     total_frames = len(env_bass)
     growth_acc = 0.0
     frame_mouth_trigger = None  # primo frame in cui si supera thr_mouth
@@ -1156,17 +1171,38 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                 [10.0, 40.0]) * base_intensity + np.array([em * 4.0, 0.0])
             frame = dislocate_feature(frame, nose_mask, nose_offset, hole_fill=hole_fill)
 
-        # 4) strappo a strisce sulla meta' inferiore del volto: solo a
-        # collasso quasi completo, resta attivo una volta innescato
-        if enable_tear and growth_acc >= thr_tear:
-            tear_progress = (growth_acc - thr_tear) / max(1.0 - thr_tear, 1e-6)
-            n_strips = 6
-            offsets = [(rng.uniform(-1, 1)) * tear_progress * 40.0 * base_intensity
-                       for _ in range(n_strips)]
-            bleed = np.array([0.05, 0.02, 0.35], dtype=np.float32)
+        # 4) strappo a strisce sulla meta' inferiore del volto: come le
+        # celle Voronoi, ogni striscia accumula tensione in base alla
+        # distanza dall'epicentro (il centro della bocca) e all'energia dei
+        # bassi/beat; supera la sua soglia -> si rompe per sempre e da quel
+        # momento si muove con inerzia vera, nella sua direzione fissa
+        # (mai piu' ricalcolata a caso ad ogni frame)
+        if enable_tear:
             mx, my, mw, mh = mouth_bbox
-            frame = tear_strips(frame, mx - 10, my + mh // 3, mw + 20, mh - mh // 3,
-                                 n_strips, offsets, bleed)
+            strip_zone_h = mh - mh // 3
+            strip_h = max(strip_zone_h // n_tear_strips, 1)
+            strip_centers_y = (my + mh // 3) + (np.arange(n_tear_strips) + 0.5) * strip_h
+            dist_from_epicenter = np.abs(strip_centers_y - mouth_center[1]) + 1.0
+
+            impact_force = eb * base_intensity * 90.0
+            if f in beat_frames:
+                impact_force *= 2.0
+            local_force = impact_force / dist_from_epicenter
+
+            if growth_acc >= thr_tear:
+                tear_strain += local_force
+                newly = (~tear_broken) & (tear_strain > 300.0)
+                tear_broken |= newly
+
+            if tear_broken.any():
+                active = tear_broken
+                tear_vel[active] = tear_vel[active] * 0.92 + \
+                    tear_dir[active] * local_force[active] * 0.15
+                tear_offset[active] += tear_vel[active]
+
+                bleed = np.array([0.05, 0.02, 0.35], dtype=np.float32)
+                frame = tear_strips(frame, mx - 10, my + mh // 3, mw + 20, strip_zone_h,
+                                     n_tear_strips, tear_offset.tolist(), bleed)
 
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
