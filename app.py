@@ -243,6 +243,19 @@ def detect_landmarks(img_float_bgr):
     if len(faces) == 0:
         faces = detector(gray, 2)
     if len(faces) == 0:
+        # ultima risorsa: detector.run() permette di abbassare la soglia di
+        # decisione dell'SVM (adjust_threshold, default 0.0) - alcuni volti
+        # con proporzioni fuori dal comune (pose estreme, distorsioni
+        # geometriche pesanti) vengono scartati per un margine minimo;
+        # abbassando la soglia si accettano anche rilevamenti "borderline"
+        # che altrimenti sarebbero scartati. Non risolve casi di distorsione
+        # geometrica molto estrema (proporzioni del tutto diverse da un
+        # volto umano normale), ma aiuta nei casi limite.
+        dets, scores, _ = detector.run(gray, 2, -1.0)
+        if len(dets) > 0:
+            best = int(np.argmax(scores))
+            faces = [dets[best]]
+    if len(faces) == 0:
         return None
     shape = predictor(gray, faces[0])
     pts = np.array([[p.x, p.y] for p in shape.parts()], dtype=np.float32)
@@ -739,16 +752,123 @@ def dislocate_feature(frame, hull_mask, offset, hole_fill="inpaint", precomputed
     return base * (1 - m3) + moved_patch * m3
 
 
-def corrode_feature(frame, hull_mask, growth_px, rng, corrosion_color=None):
+def perlin_noise_2d(shape, res=(6, 8), seed=0):
+    """Rumore di Perlin 2D (Perlin, 'An Image Synthesizer', SIGGRAPH 1985;
+    formulazione corretta in 'Improving Noise', 2002). A differenza del
+    rumore bianco (ogni pixel indipendente dagli altri, aspetto da
+    'statica elettronica'), il rumore di Perlin e' spazialmente coerente:
+    si generano gradienti casuali su una griglia rada, poi si interpola
+    (con una curva 'fade' che azzera le derivate ai bordi delle celle) il
+    prodotto scalare tra gradiente e vettore di offset - il risultato sono
+    chiazze organiche continue, molto piu' vicine a un'erosione biologica
+    reale che a un artefatto digitale."""
+    rng = np.random.default_rng(seed)
+    h, w = shape
+    res_y, res_x = res
+    d = (h // res_y, w // res_x)
+    gy, gx = res_y * d[0], res_x * d[1]
+
+    angles = rng.uniform(0, 2 * np.pi, (res_y + 1, res_x + 1))
+    gradients = np.dstack([np.cos(angles), np.sin(angles)])
+
+    def tile_grad(grad):
+        return np.repeat(np.repeat(grad, d[0], axis=0), d[1], axis=1)
+
+    g00 = tile_grad(gradients[:-1, :-1])
+    g10 = tile_grad(gradients[1:, :-1])
+    g01 = tile_grad(gradients[:-1, 1:])
+    g11 = tile_grad(gradients[1:, 1:])
+
+    grid_y, grid_x = np.mgrid[0:gy, 0:gx].astype(np.float32)
+    grid_y = (grid_y % d[0]) / d[0]
+    grid_x = (grid_x % d[1]) / d[1]
+
+    def dot(grad, dx, dy):
+        return grad[..., 0] * dx + grad[..., 1] * dy
+
+    n00 = dot(g00, grid_x, grid_y)
+    n10 = dot(g10, grid_x, grid_y - 1)
+    n01 = dot(g01, grid_x - 1, grid_y)
+    n11 = dot(g11, grid_x - 1, grid_y - 1)
+
+    def fade(t):
+        return 6 * t ** 5 - 15 * t ** 4 + 10 * t ** 3
+
+    u, v = fade(grid_x), fade(grid_y)
+    nx0 = n00 * (1 - u) + n01 * u
+    nx1 = n10 * (1 - u) + n11 * u
+    result = nx0 * (1 - v) + nx1 * v
+
+    if (gy, gx) != (h, w):
+        result = cv2.resize(result, (w, h))
+    return result.astype(np.float32)
+
+
+def build_laplacian_pyramid(img, levels):
+    """Decomposizione in una piramide Laplaciana: ogni livello contiene il
+    dettaglio perso passando da una risoluzione alla successiva (residuo
+    tra l'immagine e la sua versione sfocata/sottocampionata), l'ultimo
+    livello e' la base a bassa risoluzione. Ricostruire sommando tutti i
+    livelli restituisce esattamente l'immagine di partenza."""
+    pyr = []
+    current = img.copy()
+    for _ in range(levels):
+        down = cv2.pyrDown(current)
+        up = cv2.pyrUp(down, dstsize=(current.shape[1], current.shape[0]))
+        pyr.append(current - up)
+        current = down
+    pyr.append(current)
+    return pyr
+
+
+def collapse_laplacian_pyramid(pyr):
+    current = pyr[-1]
+    for level in reversed(pyr[:-1]):
+        current = cv2.pyrUp(current, dstsize=(level.shape[1], level.shape[0])) + level
+    return current
+
+
+def eulerian_pulse(base_img, pulse_value, level=2, amplify=10.0):
+    """Amplificazione Euleriana (Wu, Rubinstein, Shih, Guttag, Durand,
+    Freeman - 'Eulerian Video Magnification for Revealing Subtle Changes
+    in the World', SIGGRAPH 2012): nel paper si decompone un video reale
+    in una piramide spaziale, si isola una banda di frequenza temporale
+    (es. il battito cardiaco) e la si amplifica per rivelare variazioni
+    altrimenti invisibili all'occhio nudo. Qui non c'e' un video da cui
+    estrarre un segnale reale, quindi lo SINTETIZZIAMO dall'inviluppo
+    audio (un 'polso' sincronizzato con la musica invece che con un
+    battito vero) e usiamo la stessa tecnica - decomposizione in piramide,
+    amplificazione di un solo livello, ricomposizione - per iniettarlo nel
+    frame in modo spazialmente coerente (una data frequenza spaziale, non
+    un filtro colore uniforme su tutta l'immagine)."""
+    pyr = build_laplacian_pyramid(base_img, level + 1)
+    pyr[level] = pyr[level] * (1.0 + amplify * pulse_value)
+    return np.clip(collapse_laplacian_pyramid(pyr), 0, 1)
+
+
+def corrode_feature(frame, hull_mask, growth_px, rng, corrosion_color=None, noise_field=None):
     """Consuma la regione dall'interno verso l'esterno: la maschera si
     espande (dilate) in modo monotono con growth_px, mai in contrazione,
     quindi il danno non si richiude mai. Il contenuto eroso viene
-    sostituito da rumore/colore, non da un tentativo di 'riparare'."""
+    sostituito da rumore/colore, non da un tentativo di 'riparare'.
+    noise_field: se fornito (un campo di Perlin precalcolato UNA VOLTA
+    prima del loop sui frame, stessa dimensione di frame), sostituisce il
+    rumore bianco generato da rng con texture organica spazialmente
+    coerente - il pattern resta lo stesso (viene solo rivelato di piu' man
+    mano che growth_px cresce), invece di 'sfarfallare' diverso ad ogni
+    frame come farebbe rng.uniform rigenerato ogni volta."""
     if growth_px <= 0:
         return frame
     kernel = np.ones((3, 3), np.uint8)
     grown_mask = cv2.dilate(hull_mask, kernel, iterations=int(growth_px))
-    if corrosion_color is None:
+
+    if noise_field is not None:
+        field = noise_field[..., None]  # (h, w, 1), range circa -0.6..0.6
+        if corrosion_color is None:
+            noise = np.repeat(np.clip(field * 0.5 + 0.5, 0, 1) * 0.15, 3, axis=2)
+        else:
+            noise = np.clip(np.array(corrosion_color, dtype=np.float32) + field * 0.06, 0, 1)
+    elif corrosion_color is None:
         noise = rng.uniform(0, 0.15, frame.shape).astype(np.float32)
     else:
         noise = np.broadcast_to(np.array(corrosion_color, dtype=np.float32),
@@ -1088,7 +1208,8 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                                    mode_score=0.0, complexity_score=0.5,
                                    enable_corrode=True, enable_dislocate=True,
                                    enable_explode=True, enable_tear=True, use_mls=False,
-                                   hole_fill="inpaint"):
+                                   hole_fill="inpaint", use_perlin_corrosion=True,
+                                   enable_pulse=False, pulse_amplify=10.0, pulse_level=2):
     """Stessa mesh anatomica di Anatomical Warp come base, ma superate
     soglie crescenti di energia accumulata (growth_acc, monotona) le
     feature vengono DANNEGGIATE in modo permanente invece di deformate
@@ -1112,6 +1233,8 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
 
     eye_r_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_r"])
     eye_l_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_l"])
+    corrosion_field = perlin_noise_2d(base_img.shape[:2], res=(6, 8), seed=seed) \
+        if use_perlin_corrosion else None
     nose_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["nose"])
     nose_fill_cache = None
     if enable_dislocate and hole_fill == "criminisi":
@@ -1150,6 +1273,17 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
     growth_acc = 0.0
     frame_mouth_trigger = None  # primo frame in cui si supera thr_mouth
 
+    # 'polso' pre-distruzione (Eulerian Video Magnification): un inviluppo
+    # dei bassi smussato nel tempo, cosi' il polso ha un andamento lento e
+    # continuo invece di seguire ogni singolo picco - un respiro, non uno
+    # scatto
+    if enable_pulse:
+        smooth_win = max(int(total_frames * 0.03), 3)
+        pulse_env = ndimage.uniform_filter1d(np.asarray(env_bass, dtype=np.float32),
+                                              size=smooth_win)
+    else:
+        pulse_env = None
+
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
         avg_e = (eb + em + eh_) / 3.0
@@ -1179,8 +1313,10 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
         if enable_corrode and growth_acc >= thr_eye:
             eye_growth_px = (growth_acc - thr_eye) / max(1.0 - thr_eye, 1e-6) * 14.0 * base_intensity
             eye_growth_px += eh_ * 2.0
-            frame = corrode_feature(frame, eye_r_mask, eye_growth_px, rng)
-            frame = corrode_feature(frame, eye_l_mask, eye_growth_px, rng)
+            frame = corrode_feature(frame, eye_r_mask, eye_growth_px, rng,
+                                     noise_field=corrosion_field)
+            frame = corrode_feature(frame, eye_l_mask, eye_growth_px, rng,
+                                     noise_field=corrosion_field)
 
         # 3) dislocazione naso: guidata dai medi, soglia intermedia,
         # l'offset cresce in modo monotono con growth_acc (mai a ritroso)
@@ -1222,6 +1358,12 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                 bleed = np.array([0.05, 0.02, 0.35], dtype=np.float32)
                 frame = tear_strips(frame, mx - 10, my + mh // 3, mw + 20, strip_zone_h,
                                      n_tear_strips, tear_offset.tolist(), bleed)
+
+        # polso pre-distruzione: solo prima che scatti il primo danno reale
+        # (thr_eye) - l'attesa/il presagio prima che il corpo ceda davvero
+        if enable_pulse and growth_acc < thr_eye:
+            frame = eulerian_pulse(frame, float(pulse_env[f]), level=pulse_level,
+                                    amplify=pulse_amplify)
 
         frame = clinical_grade(frame)
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
@@ -1272,6 +1414,78 @@ def compute_voronoi_cells(img, region_mask, n_points, rng):
     labels = build_cell_labels((h, w), points)
     boxes = ndimage.find_objects(labels + 1)
     return points, labels, boxes
+
+
+def build_delaunay_edges(points):
+    """Rete di vincoli di distanza tra celle vicine, via triangolazione
+    Delaunay: ogni lato dei triangoli diventa un vincolo di rest-length
+    per Position Based Dynamics - le celle collegate da un vincolo intatto
+    si comportano come un unico corpo semi-rigido."""
+    tri = Delaunay(points)
+    edges = set()
+    for simplex in tri.simplices:
+        for i in range(3):
+            a, b = int(simplex[i]), int(simplex[(i + 1) % 3])
+            edges.add((min(a, b), max(a, b)))
+    edges = np.array(sorted(edges), dtype=np.int32)
+    rest_len = np.linalg.norm(points[edges[:, 0]] - points[edges[:, 1]], axis=1).astype(np.float32)
+    return edges, rest_len
+
+
+def xpbd_fracture_step(pos, vel, rest_len, edges, broken, inv_mass, impact_center,
+                        impact_force, compliance=150.0, break_stretch=0.08,
+                        damping=0.95, solver_iters=3, dt=1.0):
+    """Un passo di Position Based Dynamics con vincoli 'compliant' in stile
+    XPBD (Macklin, Muller e Chentanez - 'XPBD: Position-Based Simulation of
+    Compliant Constrained Dynamics', 2016), estensione del PBD originale
+    di Muller, Heidelberger, Hennix e Ratcliff ('Position Based Dynamics',
+    2006/2007). Nota tecnica emersa testando questa implementazione: il
+    PBD 'puro' (correzione rigida al 100% dei vincoli, come nella prima
+    versione provata) risolve la rete di celle in modo COSI' rigido che
+    l'intera struttura trasla come un blocco unico e non accumula MAI
+    abbastanza stiramento locale da rompersi davvero - un vincolo troppo
+    rigido 'guarisce' la tensione prima che possa accumularsi, ad ogni
+    singolo frame. Il termine di compliance ammorbidisce la correzione
+    quel tanto che basta perche' lo stiramento sia reale e misurabile,
+    permettendo alla rottura di accadere. Le celle piu' lontane
+    dall'epicentro sono 'ancorate' (inv_mass=0): senza un punto fisso
+    contro cui il resto della struttura possa tirare, l'intera rete
+    trasla insieme e non si stacca mai nulla - con le ancore, invece, le
+    celle vicine all'impatto si allontanano davvero da quelle ferme."""
+    dx = pos[:, 0] - impact_center[0]
+    dy = pos[:, 1] - impact_center[1]
+    dist = np.sqrt(dx * dx + dy * dy) + 1.0
+    dirx, diry = dx / dist, dy / dist
+    kick = (impact_force / dist)[:, None] * np.stack([dirx, diry], axis=1) * 0.02
+    kick = kick * inv_mass[:, None]
+
+    vel = vel * damping + kick
+    vel[inv_mass == 0] = 0.0
+    pred = pos + vel * dt
+
+    for _ in range(solver_iters):
+        for k in range(len(edges)):
+            if broken[k]:
+                continue
+            a, b = edges[k]
+            wa, wb = inv_mass[a], inv_mass[b]
+            wsum = wa + wb
+            if wsum == 0:
+                continue
+            diff = pred[a] - pred[b]
+            d = np.linalg.norm(diff) + 1e-6
+            c = d - rest_len[k]
+            if c / rest_len[k] > break_stretch:
+                broken[k] = True
+                continue
+            dlambda = -c / (wsum + compliance)
+            grad = diff / d
+            pred[a] += wa * dlambda * grad
+            pred[b] -= wb * dlambda * grad
+
+    vel = (pred - pos) / dt
+    vel[inv_mass == 0] = 0.0
+    return pred, vel, broken
 
 
 def apply_voronoi_displacement(img, points, labels, boxes, intensity, rng, mode_score=0.0,
@@ -1365,30 +1579,29 @@ def apply_voronoi_displacement(img, points, labels, boxes, intensity, rng, mode_
 
 def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
                     seed, base_intensity, n_points, growth_rate, writer,
-                    mode_score=0.0, complexity_score=0.5, use_physics=False,
-                    break_threshold=0.4, damping=0.90):
+                    mode_score=0.0, complexity_score=0.5, physics_mode="none",
+                    break_threshold=0.4, damping=0.90,
+                    pbd_compliance=280.0, pbd_break_stretch=0.045, pbd_anchor_frac=0.2):
     """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM).
     I punti/celle Voronoi si ricalcolano solo ai beat (costoso), non ogni
     frame (economico): stesso identico risultato visivo, molto meno CPU.
 
-    use_physics ispira il modello di Smith, Witkin e Baraff, "Fast and
-    Controllable Simulation of the Shattering of Brittle Objects" (2001):
-    nel paper, forze vincolari calcolate con moltiplicatori di Lagrange
-    decidono QUANDO e DOVE l'oggetto si rompe, e assegnano la velocita'
-    iniziale ai frammenti. Qui, senza un vero solver di vincoli, si
-    approssima con:
-    - ogni cella accumula una "tensione" (strain) ad ogni colpo, tanto
-      maggiore quanto piu' e' vicina all'epicentro dell'impatto;
-    - finche' la tensione non supera break_threshold la cella resta
-      RIGIDA (ferma, come un oggetto intatto), non si limita a spostarsi
-      un po' meno delle altre come nella versione originale;
-    - superata la soglia, la cella si "rompe" in modo permanente (mai piu'
-      rigida) e da quel momento accumula VELOCITA' vera (non uno
-      spostamento ricalcolato da zero ogni frame): l'inerzia la porta
-      avanti anche se l'impulso che l'ha spezzata e' finito, con un
-      leggero damping invece di un arresto istantaneo.
-    Se use_physics=False, comportamento identico alla versione originale
-    (spostamento diretto dalla formula, nessuno stato tra i frame)."""
+    physics_mode:
+    - "none": comportamento originale, spostamento diretto dalla formula,
+      nessuno stato tra i frame.
+    - "impulse": ispirato a Smith, Witkin e Baraff, "Fast and Controllable
+      Simulation of the Shattering of Brittle Objects" (2001). Ogni cella
+      accumula una "tensione" ad ogni colpo (tanto maggiore quanto piu' e'
+      vicina all'epicentro), resta RIGIDA finche' la tensione non supera
+      break_threshold, poi si rompe per sempre e accumula velocita' vera
+      con inerzia (damping) invece di un ricalcolo da zero ogni frame.
+    - "pbd": Position Based Dynamics (Muller et al. 2006/2007) con vincoli
+      compliant in stile XPBD (Macklin, Muller, Chentanez 2016) tra celle
+      vicine (rete costruita via Delaunay sui punti Voronoi). Le celle
+      restano connesse come un corpo semi-rigido finche' i vincoli non si
+      spezzano individualmente per eccesso di stiramento - comportamento
+      piu' ricco di "impulse" (gruppi di celle si staccano insieme, non
+      cella per cella), ma piu' costoso e con piu' parametri da tarare."""
     total_frames = len(env_bass)
     growth_acc = 0.0
     seed_offset = 0
@@ -1396,14 +1609,32 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
     cache_rng = np.random.default_rng(seed)
     points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
-    def _reset_physics_state(n_cells):
+    def _reset_impulse_state(n_cells):
         return (np.zeros((n_cells, 2), dtype=np.float32),  # vel
                 np.zeros(n_cells, dtype=np.float32),        # strain
                 np.zeros(n_cells, dtype=bool),              # broken
                 np.zeros((n_cells, 2), dtype=np.float32))   # pos_offset
 
-    if use_physics:
-        vel, strain, broken, pos_offset = _reset_physics_state(len(points))
+    def _reset_pbd_state(pts):
+        n_cells = len(pts)
+        edges, rest_len = build_delaunay_edges(pts)
+        cy_c = pts.mean(axis=0)
+        dist_c = np.linalg.norm(pts - cy_c, axis=1)
+        n_anchor = max(int(n_cells * pbd_anchor_frac), 1)
+        anchor_idx = np.argsort(dist_c)[-n_anchor:]
+        inv_mass = np.ones(n_cells, dtype=np.float32)
+        inv_mass[anchor_idx] = 0.0
+        return (pts.copy().astype(np.float32),              # pos
+                np.zeros((n_cells, 2), dtype=np.float32),    # vel
+                edges, rest_len,
+                np.zeros(len(edges), dtype=bool),            # broken
+                inv_mass)
+
+    if physics_mode == "impulse":
+        vel, strain, broken, pos_offset = _reset_impulse_state(len(points))
+    elif physics_mode == "pbd":
+        pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
+            _reset_pbd_state(points)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -1414,8 +1645,11 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             seed_offset += 1
             cache_rng = np.random.default_rng(seed + seed_offset)
             points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
-            if use_physics:
-                vel, strain, broken, pos_offset = _reset_physics_state(len(points))
+            if physics_mode == "impulse":
+                vel, strain, broken, pos_offset = _reset_impulse_state(len(points))
+            elif physics_mode == "pbd":
+                pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
+                    _reset_pbd_state(points)
 
         # bassi: intensita' della frattura, con colpo secco sul beat
         intensity = 0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)
@@ -1424,7 +1658,7 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
 
-        if use_physics:
+        if physics_mode == "impulse":
             cx, cy = points[:, 0].mean(), points[:, 1].mean()
             fall_bias = 0.7 + max(-mode_score, 0.0) * 0.6
             impact_force = eb * base_intensity * 260.0
@@ -1454,6 +1688,23 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
                                    (0.5 + complexity_score)
 
             disp_override = (pos_offset[:, 0], pos_offset[:, 1])
+            frame = apply_voronoi_displacement(base_img, points, labels, boxes, intensity,
+                                                disp_rng, mode_score=mode_score,
+                                                complexity_score=complexity_score,
+                                                disp_override=disp_override)
+        elif physics_mode == "pbd":
+            impact_center = points.mean(axis=0)
+            impact_force = eb * base_intensity * 220.0
+            if f in beat_frames:
+                impact_force *= 2.5
+
+            pbd_pos, pbd_vel, pbd_broken = xpbd_fracture_step(
+                pbd_pos, pbd_vel, pbd_rest_len, pbd_edges, pbd_broken, pbd_inv_mass,
+                impact_center, impact_force, compliance=pbd_compliance,
+                break_stretch=pbd_break_stretch, damping=damping)
+
+            offset = pbd_pos - points
+            disp_override = (offset[:, 0], offset[:, 1])
             frame = apply_voronoi_displacement(base_img, points, labels, boxes, intensity,
                                                 disp_rng, mode_score=mode_score,
                                                 complexity_score=complexity_score,
@@ -2285,6 +2536,33 @@ def main():
                  "eye corrosion in later frames - a reasonable trade-off "
                  "for an effect meant to look visibly \"broken\" anyway.",
         )
+        ad_perlin_corrosion = st.checkbox(
+            "Corrosione organica (rumore di Perlin) / Organic corrosion "
+            "(Perlin noise)",
+            value=True, key="ad_perlin_corrosion",
+            help="Texture spazialmente coerente (chiazze) invece di "
+                 "rumore bianco uniforme - piu' vicina a un'erosione "
+                 "biologica reale che a un artefatto digitale. / "
+                 "Spatially coherent texture (blotches) instead of "
+                 "uniform white noise - closer to real biological "
+                 "erosion than a digital artifact.",
+        )
+        ad_enable_pulse = st.checkbox(
+            "Polso pre-distruzione (Eulerian Video Magnification) / "
+            "Pre-destruction pulse",
+            value=False, key="ad_enable_pulse",
+            help="Prima che scatti il primo danno reale, la pelle "
+                 "'respira' impercettibilmente a tempo con i bassi - "
+                 "un presagio prima del collasso, non il collasso "
+                 "stesso. / Before the first real damage kicks in, the "
+                 "skin imperceptibly 'breathes' in time with the bass - "
+                 "a premonition before the collapse, not the collapse "
+                 "itself.",
+        )
+        ad_pulse_amplify = st.slider(
+            "Intensita' polso / Pulse intensity", 2.0, 30.0, 10.0, 1.0,
+            key="ad_pulse_amplify", disabled=not ad_enable_pulse,
+        )
     with st.expander("Voronoi Fracture",
                       expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
         if style_key == STYLE_COMBO:
@@ -2296,23 +2574,51 @@ def main():
                                key="vf_points")
         vf_growth = st.slider("Velocita' progressione / Growth rate", 0.5, 5.0, 2.0, 0.5,
                                key="vf_growth")
-        vf_use_physics = st.checkbox(
-            "Fisica d'impatto (Smith-Witkin-Baraff) / Impact physics",
-            value=False, key="vf_use_physics",
-            help="Le celle restano rigide (ferme) finche' la tensione "
-                 "accumulata dai colpi non supera una soglia; una volta "
-                 "rotte accumulano velocita' vera con inerzia, invece di "
-                 "ricalcolare lo spostamento da zero ad ogni frame. Solo "
-                 "per Voronoi Fracture da solo, non nel combo con "
-                 "Capillary. / Cells stay rigid until accumulated impact "
-                 "strain crosses a threshold; once broken they gain real "
-                 "velocity with inertia instead of a from-scratch "
-                 "displacement each frame. Voronoi Fracture alone only, "
-                 "not in the Capillary combo.",
+        vf_physics_mode = st.selectbox(
+            "Modello fisico / Physics model",
+            ["Nessuno (originale)", "Impulso semplice (Smith-Witkin-Baraff)",
+             "Position Based Dynamics"],
+            index=0, key="vf_physics_mode",
+            help="'Impulso semplice': ogni cella si rompe per conto suo "
+                 "quando la tensione accumulata supera una soglia, poi si "
+                 "muove con inerzia. 'Position Based Dynamics': le celle "
+                 "sono collegate da vincoli (come una rete) e si comportano "
+                 "come un corpo semi-rigido finche' i singoli vincoli non "
+                 "si spezzano - gruppi di celle si staccano insieme, non "
+                 "cella per cella, ma richiede piu' tempo di calcolo. "
+                 "Solo per Voronoi Fracture da solo, non nel combo con "
+                 "Capillary. / 'Simple impulse': each cell breaks on its "
+                 "own once accumulated strain crosses a threshold, then "
+                 "moves with inertia. 'Position Based Dynamics': cells are "
+                 "linked by constraints (a network) and behave as a "
+                 "semi-rigid body until individual constraints snap - "
+                 "groups of cells detach together, not cell by cell, but "
+                 "costs more compute. Voronoi Fracture alone only, not in "
+                 "the Capillary combo.",
         )
+        _vf_physics_map = {"Nessuno (originale)": "none",
+                            "Impulso semplice (Smith-Witkin-Baraff)": "impulse",
+                            "Position Based Dynamics": "pbd"}
+        vf_physics_key = _vf_physics_map[vf_physics_mode]
         vf_break_threshold = st.slider(
-            "Soglia di rottura / Break threshold", 0.1, 1.0, 0.4, 0.05,
-            key="vf_break_threshold", disabled=not vf_use_physics,
+            "Soglia di rottura (impulso) / Break threshold (impulse)", 0.1, 1.0, 0.4, 0.05,
+            key="vf_break_threshold", disabled=(vf_physics_key != "impulse"),
+        )
+        vf_pbd_compliance = st.slider(
+            "Elasticita' vincoli (PBD) / Constraint compliance (PBD)", 20.0, 400.0, 280.0, 10.0,
+            key="vf_pbd_compliance", disabled=(vf_physics_key != "pbd"),
+            help="Piu' alto = i vincoli tra celle cedono di piu' prima di "
+                 "rompersi (frattura piu' 'morbida' e progressiva). Con "
+                 "valori troppo bassi (vicino alla rigidita' pura) la rete "
+                 "di celle trasla come un blocco unico e non si rompe mai. "
+                 "/ Higher = constraints between cells give more before "
+                 "snapping (softer, more gradual fracture). Too low "
+                 "(near-pure rigidity) and the cell network just "
+                 "translates as one block and never breaks.",
+        )
+        vf_pbd_break_stretch = st.slider(
+            "Stiramento di rottura (PBD) / Break stretch (PBD)", 0.02, 0.3, 0.045, 0.005,
+            key="vf_pbd_break_stretch", disabled=(vf_physics_key != "pbd"),
         )
     with st.expander("Capillary Bleed", expanded=(style_key == STYLE_CAPILLARY)):
         cb_intensity = st.slider("Intensita' venature / Vein intensity", 0.2, 3.0, 1.0, 0.1,
@@ -2522,7 +2828,8 @@ def main():
                         writer=writer, mode_score=mode_score, complexity_score=complexity_score,
                         enable_corrode=ad_corrode, enable_dislocate=ad_dislocate,
                         enable_explode=ad_explode, enable_tear=ad_tear, use_mls=bool(ad_use_mls),
-                        hole_fill=ad_hole_fill,
+                        hole_fill=ad_hole_fill, use_perlin_corrosion=bool(ad_perlin_corrosion),
+                        enable_pulse=bool(ad_enable_pulse), pulse_amplify=float(ad_pulse_amplify),
                     )
                 elif style_key == STYLE_VORONOI:
                     render_voronoi(
@@ -2530,8 +2837,10 @@ def main():
                         int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
                         n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
                         mode_score=mode_score, complexity_score=complexity_score,
-                        use_physics=bool(vf_use_physics),
+                        physics_mode=vf_physics_key,
                         break_threshold=float(vf_break_threshold),
+                        pbd_compliance=float(vf_pbd_compliance),
+                        pbd_break_stretch=float(vf_pbd_break_stretch),
                     )
                 elif style_key == STYLE_CAPILLARY:
                     render_capillary_bleed(
