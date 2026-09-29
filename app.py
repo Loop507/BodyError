@@ -2,7 +2,6 @@
 """BodyError // Loop507 - foto -> video di scomposizione anatomica, ancorata
 ai landmark del volto (dlib) e guidata da 3 bande audio (bassi/medi/alti)."""
 
-import hashlib
 import os
 import subprocess
 import tempfile
@@ -169,20 +168,34 @@ _DLIB_DETECTOR = None
 _DLIB_PREDICTOR = None
 
 
-DLIB_MODEL_SHA1 = "73fde5e05226548677a050913eed4e04f39c6ff"
+def _dlib_model_is_valid(path):
+    """Verifica FUNZIONALE invece di un hash fisso: un checksum esatto
+    scritto a mano si e' rivelato un problema peggiore del bug che doveva
+    risolvere (un valore sbagliato scartava per sempre anche un download
+    perfettamente riuscito, senza che nessuna foto potesse mai essere
+    analizzata). Qui il file e' considerato valido se dlib stesso riesce a
+    caricarlo come shape_predictor - se dlib lo accetta ed e' di dimensione
+    plausibile, e' valido, punto; non serve conoscere in anticipo il suo
+    hash esatto."""
+    if not os.path.exists(path) or os.path.getsize(path) < 80_000_000:
+        return False
+    try:
+        dlib.shape_predictor(path)
+        return True
+    except Exception:
+        return False
 
 
 def _ensure_dlib_model():
     """Scarica e decomprime il modello dlib al primo utilizzo, con verifica
-    del checksum e scrittura atomica: un file presente ma incompleto o
+    funzionale e scrittura atomica: un file presente ma incompleto o
     corrotto (download interrotto a meta') viene scartato e riscaricato
     invece di restare silenziosamente "valido" per sempre, e il rename
     atomico finale evita che una sessione concorrente legga un file a
     meta' scritto."""
+    if _dlib_model_is_valid(DLIB_MODEL_PATH):
+        return
     if os.path.exists(DLIB_MODEL_PATH):
-        with open(DLIB_MODEL_PATH, "rb") as f:
-            if hashlib.sha1(f.read()).hexdigest() == DLIB_MODEL_SHA1:
-                return
         os.unlink(DLIB_MODEL_PATH)
 
     import bz2
@@ -197,10 +210,10 @@ def _ensure_dlib_model():
             urllib.request.urlretrieve(DLIB_MODEL_URL, tmp_compressed)
             with open(tmp_compressed, "rb") as f_in:
                 data = bz2.decompress(f_in.read())
-            if hashlib.sha1(data).hexdigest() != DLIB_MODEL_SHA1:
-                raise ValueError("checksum del modello non corrispondente")
             with open(tmp_final, "wb") as f_out:
                 f_out.write(data)
+            if not _dlib_model_is_valid(tmp_final):
+                raise ValueError("dlib non riesce a caricare il file scaricato")
             os.replace(tmp_final, DLIB_MODEL_PATH)
             return
         except Exception as exc:
