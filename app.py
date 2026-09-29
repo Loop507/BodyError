@@ -916,6 +916,131 @@ def tear_strips(frame, x0, y0, w, h, n_strips, offsets, fill_color):
     return out
 
 
+def build_tear_path(origin, direction_sign, length_px, n_pts, rng):
+    """Percorso della crepa: parte da `origin` e procede orizzontalmente
+    (verso destra se direction_sign > 0, sinistra altrimenti) con un
+    andamento sinuoso ma a CURVATURA LIMITATA, piu' una leggera deriva
+    verso il basso. Il limite di curvatura non e' estetico: testando una
+    prima versione piu' serpeggiante, sul lato concavo delle curve il punto
+    piu' vicino sul percorso saltava da un tratto all'altro e lo
+    spostamento aveva salti fino a 15 px (una cucitura visibile). Con un
+    raggio di curvatura almeno ~2x la zona d'influenza dello strappo l'asse
+    mediano cade fuori dall'area deformata. Il percorso e' fisso per tutto
+    il render: cio' che cresce e' quanto ne viene rivelato."""
+    base_ang = 0.0 if direction_sign > 0 else np.pi
+    max_turn = 0.05          # rad per passo
+    max_dev = 0.6            # deviazione massima dall'angolo di base
+    ang = base_ang
+    step = length_px / max(n_pts, 1)
+    path = [np.array(origin, dtype=np.float32)]
+    for _ in range(n_pts):
+        ang += float(np.clip(rng.normal(0.0, 0.06), -max_turn, max_turn))
+        ang = base_ang + float(np.clip((ang - base_ang) * 0.96, -max_dev, max_dev))
+        move = step * np.array([np.cos(ang), np.sin(ang)], dtype=np.float32)
+        move[1] += 0.15 * step
+        path.append(path[-1] + move)
+    return np.array(path, dtype=np.float32)
+
+
+def tear_build_cache(path_pts, revealed_n, img_shape, pad, rough_field=None,
+                     dense_per_seg=6):
+    """Per ogni pixel di una regione di interesse (ROI) attorno alla crepa
+    rivelata finora, calcola distanza dalla crepa, direzione (dal punto
+    piu' vicino verso il pixel) e posizione frazionaria lungo il percorso.
+    E' la parte costosa (query cKDTree su tutti i pixel della ROI): si
+    ricalcola solo quando la crepa avanza di un punto, non a ogni frame -
+    per frame cambia solo la larghezza dell'apertura.
+    rough_field: campo di rugosita' a piena immagine (es. Perlin), generato
+    UNA volta e solo ritagliato qui: se lo si rigenerasse per ogni ROI, i
+    bordi dello strappo 'scatterebbero' ad ogni avanzamento della crepa."""
+    h, w = img_shape[:2]
+    seg = path_pts[:revealed_n + 1]
+    if len(seg) < 2:
+        return None
+    dense, dense_idx = [], []
+    for i in range(len(seg) - 1):
+        for t in np.linspace(0.0, 1.0, dense_per_seg, endpoint=False):
+            dense.append(seg[i] * (1 - t) + seg[i + 1] * t)
+            dense_idx.append(i + t)
+    dense.append(seg[-1]); dense_idx.append(float(len(seg) - 1))
+    dense = np.array(dense, dtype=np.float32)
+    dense_idx = np.array(dense_idx, dtype=np.float32)
+
+    x0 = int(max(np.floor(dense[:, 0].min() - pad), 0))
+    x1 = int(min(np.ceil(dense[:, 0].max() + pad), w))
+    y0 = int(max(np.floor(dense[:, 1].min() - pad), 0))
+    y1 = int(min(np.ceil(dense[:, 1].max() + pad), h))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+
+    yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+    pix = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    tree = cKDTree(dense)
+    dist, nn = tree.query(pix)
+    near = dense[nn]
+    norm = np.maximum(dist, 1e-6)[:, None]
+    dirs = (pix - near) / norm
+    shape2d = (y1 - y0, x1 - x0)
+    return {
+        "roi": (x0, y0, x1, y1),
+        "dist": dist.reshape(shape2d).astype(np.float32),
+        "dirx": dirs[:, 0].reshape(shape2d).astype(np.float32),
+        "diry": dirs[:, 1].reshape(shape2d).astype(np.float32),
+        "pt_pos": dense_idx[nn].reshape(shape2d),
+        "rough": None if rough_field is None else rough_field[y0:y1, x0:x1].astype(np.float32),
+        "xx": xx, "yy": yy, "n_seg": len(seg) - 1,
+    }
+
+
+def tear_apply(frame, cache, openness, max_gap_px, falloff_px, fill_color,
+               rough_px=0.0, smooth_sigma=3.0):
+    """Apre la crepa: nella fascia attorno alla linea (meta' larghezza
+    locale = gap_half) si mostra il colore di riempimento, piu' scuro ai
+    bordi e piu' vivo al centro; fuori dalla fascia i pixel vengono
+    campionati da una posizione spostata verso la crepa di un tratto che
+    decade con la distanza (la pelle si STIRA ai bordi dello strappo invece
+    di traslare rigidamente; il resto dell'immagine resta intatto). La
+    larghezza e' massima all'origine e va a zero in punta (taper).
+    rough_px: ampiezza della rugosita' del bordo (distanza perturbata da
+    rumore coerente: bordi irregolari invece di un tubo liscio).
+    smooth_sigma: leggera sfocatura del campo di spostamento, rete di
+    sicurezza contro residui di discontinuita' vicino all'asse mediano."""
+    if cache is None:
+        return frame
+    x0, y0, x1, y1 = cache["roi"]
+    n_seg = max(cache["n_seg"], 1)
+    taper = np.clip(1.0 - cache["pt_pos"] / n_seg, 0.0, 1.0) ** 0.6
+    gap_half = 0.5 * max_gap_px * openness * taper
+    d = cache["dist"]
+    if cache["rough"] is not None and rough_px > 0:
+        d = d + cache["rough"] * rough_px
+
+    shift = gap_half * np.clip(1.0 - (d - gap_half) / max(falloff_px, 1.0), 0.0, 1.0)
+    dx_f = cache["dirx"] * shift
+    dy_f = cache["diry"] * shift
+    if smooth_sigma > 0:
+        dx_f = cv2.GaussianBlur(dx_f, (0, 0), smooth_sigma)
+        dy_f = cv2.GaussianBlur(dy_f, (0, 0), smooth_sigma)
+    src_x = (cache["xx"] - dx_f - x0).astype(np.float32)
+    src_y = (cache["yy"] - dy_f - y0).astype(np.float32)
+
+    roi = frame[y0:y1, x0:x1]
+    warped = cv2.remap(roi, src_x, src_y, interpolation=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REFLECT_101)
+
+    inside = (d < gap_half) & (gap_half > 0.5)
+    if inside.any():
+        depth = 1.0 - np.clip(d / np.maximum(gap_half, 1e-6), 0.0, 1.0)  # 1 al centro
+        shade = (0.35 + 0.65 * depth)[..., None]
+        fill = np.array(fill_color, dtype=np.float32)[None, None, :] * shade
+        m = inside[..., None].astype(np.float32)
+        warped = warped * (1 - m) + fill * m
+
+    out = frame.copy()
+    out[y0:y1, x0:x1] = warped
+    return out
+
+
 def compute_smile_score(pts):
     """Curvatura della bocca nella foto ORIGINALE (dai landmark, non da Haar
     Cascade - piu' preciso): positivo se sorride, vicino a zero/negativo se
@@ -1209,7 +1334,8 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                                    enable_corrode=True, enable_dislocate=True,
                                    enable_explode=True, enable_tear=True, use_mls=False,
                                    hole_fill="inpaint", use_perlin_corrosion=True,
-                                   enable_pulse=False, pulse_amplify=10.0, pulse_level=2):
+                                   enable_pulse=False, pulse_amplify=10.0, pulse_level=2,
+                                   tear_mode="strips"):
     """Stessa mesh anatomica di Anatomical Warp come base, ma superate
     soglie crescenti di energia accumulata (growth_acc, monotona) le
     feature vengono DANNEGGIATE in modo permanente invece di deformate
@@ -1233,8 +1359,17 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
 
     eye_r_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_r"])
     eye_l_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["eye_l"])
-    corrosion_field = perlin_noise_2d(base_img.shape[:2], res=(6, 8), seed=seed) \
-        if use_perlin_corrosion else None
+    # due campi di Perlin indipendenti, fatti evolvere lentamente l'uno
+    # nell'altro durante il render: la texture di corrosione "striscia" e
+    # cambia forma piano piano invece di restare identica per tutto il
+    # video (che era il limite della versione con un solo campo statico).
+    # Nota: a meta' del passaggio i due campi si mediano e il contrasto
+    # cala un po' - un "respiro" della texture, non un difetto.
+    if use_perlin_corrosion:
+        corrosion_field_a = perlin_noise_2d(base_img.shape[:2], res=(6, 8), seed=seed)
+        corrosion_field_b = perlin_noise_2d(base_img.shape[:2], res=(6, 8), seed=seed + 101)
+    else:
+        corrosion_field_a = corrosion_field_b = None
     nose_mask = _group_hull_mask(base_img.shape, pts, LANDMARK_GROUPS["nose"])
     nose_fill_cache = None
     if enable_dislocate and hole_fill == "criminisi":
@@ -1262,6 +1397,29 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
     # direzione di ogni striscia veniva ri-sorteggiata ad ogni frame
     # (rng.uniform dentro il loop): il "danno" poteva letteralmente
     # cambiare direzione frame per frame invece di restare permanente.
+    # tear_mode="crack": crepa che si propaga (ispirata all'idea di Pfaff,
+    # Narain, de Joya e O'Brien, "Adaptive Tearing and Cracking of Thin
+    # Sheets", 2014: la frattura avanza progressivamente e si apre di piu'
+    # dove e' nata). NON e' il loro metodo (rimeshing adattivo di una
+    # simulazione di tessuto): e' un percorso fisso, rivelato un tratto alla
+    # volta dall'energia accumulata, con apertura a punta e pelle stirata.
+    crack_ctx = None
+    if enable_tear and tear_mode == "crack":
+        scale_px = max(h, w) / 720.0
+        side = 1 if (seed % 2 == 0) else -1
+        _, _, jaw_w, _ = mouth_bbox
+        n_crack = 48
+        crack_path = build_tear_path(mouth_center, side, 0.55 * jaw_w, n_crack,
+                                      np.random.default_rng(seed + 555))
+        crack_ctx = {
+            "path": crack_path, "n": n_crack, "revealed": 0, "cache": None,
+            "burst": 0.0, "open": 0.0, "scale": scale_px,
+            "max_gap": 30.0 * scale_px * min(max(base_intensity, 0.5), 1.5),
+            "falloff": 45.0 * scale_px, "rough_px": 5.0 * scale_px,
+            "rough": perlin_noise_2d((h, w), res=(max(h // 24, 2), max(w // 24, 2)),
+                                      seed=seed + 7),
+        }
+
     n_tear_strips = 6
     tear_dir = rng.choice([-1.0, 1.0], size=n_tear_strips).astype(np.float32)
     tear_vel = np.zeros(n_tear_strips, dtype=np.float32)
@@ -1313,6 +1471,12 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
         if enable_corrode and growth_acc >= thr_eye:
             eye_growth_px = (growth_acc - thr_eye) / max(1.0 - thr_eye, 1e-6) * 14.0 * base_intensity
             eye_growth_px += eh_ * 2.0
+            if corrosion_field_a is not None:
+                # oscillazione lenta (un ciclo completo ogni ~200 frame)
+                t_mix = 0.5 + 0.5 * np.sin(f * 2.0 * np.pi / 200.0)
+                corrosion_field = corrosion_field_a * (1.0 - t_mix) + corrosion_field_b * t_mix
+            else:
+                corrosion_field = None
             frame = corrode_feature(frame, eye_r_mask, eye_growth_px, rng,
                                      noise_field=corrosion_field)
             frame = corrode_feature(frame, eye_l_mask, eye_growth_px, rng,
@@ -1332,7 +1496,27 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
         # bassi/beat; supera la sua soglia -> si rompe per sempre e da quel
         # momento si muove con inerzia vera, nella sua direzione fissa
         # (mai piu' ricalcolata a caso ad ogni frame)
-        if enable_tear:
+        if enable_tear and crack_ctx is not None:
+            if growth_acc >= thr_tear:
+                prog = (growth_acc - thr_tear) / max(1.0 - thr_tear, 1e-6)
+                crack_ctx["burst"] = min(0.3, crack_ctx["burst"] +
+                                          0.03 * eb * (2.0 if f in beat_frames else 1.0))
+                frac = min(1.0, 0.15 + 0.7 * prog + crack_ctx["burst"])
+                target_n = max(int(round(frac * crack_ctx["n"])), 2)
+                if target_n > crack_ctx["revealed"]:  # solo in avanti, mai indietro
+                    crack_ctx["revealed"] = target_n
+                    pad = crack_ctx["max_gap"] / 2 + crack_ctx["falloff"] + 10
+                    crack_ctx["cache"] = tear_build_cache(
+                        crack_ctx["path"], target_n, base_img.shape, pad,
+                        rough_field=crack_ctx["rough"])
+                crack_ctx["open"] = max(crack_ctx["open"], 0.3 + 0.7 * prog)
+                openness = min(1.0, crack_ctx["open"] + 0.15 * eb)
+                frame = tear_apply(frame, crack_ctx["cache"], openness,
+                                    crack_ctx["max_gap"], crack_ctx["falloff"],
+                                    np.array([0.05, 0.02, 0.35], dtype=np.float32),
+                                    rough_px=crack_ctx["rough_px"],
+                                    smooth_sigma=3.0)
+        elif enable_tear:
             mx, my, mw, mh = mouth_bbox
             strip_zone_h = mh - mh // 3
             strip_h = max(strip_zone_h // n_tear_strips, 1)
@@ -1432,9 +1616,12 @@ def build_delaunay_edges(points):
     return edges, rest_len
 
 
+PBD_FORCE_GAIN = 8.0  # calibrato su punti reali (Canny) e finestre di beat a 24 fps
+
+
 def xpbd_fracture_step(pos, vel, rest_len, edges, broken, inv_mass, impact_center,
-                        impact_force, compliance=150.0, break_stretch=0.08,
-                        damping=0.95, solver_iters=3, dt=1.0):
+                        impact_force, compliance=280.0, break_stretch=0.09,
+                        damping=0.95, solver_iters=3, dt=1.0, scale=1.0):
     """Un passo di Position Based Dynamics con vincoli 'compliant' in stile
     XPBD (Macklin, Muller e Chentanez - 'XPBD: Position-Based Simulation of
     Compliant Constrained Dynamics', 2016), estensione del PBD originale
@@ -1454,9 +1641,13 @@ def xpbd_fracture_step(pos, vel, rest_len, edges, broken, inv_mass, impact_cente
     celle vicine all'impatto si allontanano davvero da quelle ferme."""
     dx = pos[:, 0] - impact_center[0]
     dy = pos[:, 1] - impact_center[1]
-    dist = np.sqrt(dx * dx + dy * dy) + 1.0
+    # scale = max(larghezza, altezza) / 720: normalizza la forza per la
+    # risoluzione di render. Senza, la stessa impostazione rompeva il doppio
+    # dei vincoli a meta' risoluzione (le distanze sono in pixel assoluti).
+    dist = np.sqrt(dx * dx + dy * dy) + 1.0 * scale
     dirx, diry = dx / dist, dy / dist
-    kick = (impact_force / dist)[:, None] * np.stack([dirx, diry], axis=1) * 0.02
+    kick = (impact_force * PBD_FORCE_GAIN / (dist / scale))[:, None] \
+        * np.stack([dirx, diry], axis=1) * 0.02 * scale
     kick = kick * inv_mass[:, None]
 
     vel = vel * damping + kick
@@ -1577,11 +1768,41 @@ def apply_voronoi_displacement(img, points, labels, boxes, intensity, rng, mode_
     return np.clip(result, 0, 1)
 
 
+def voronoi_reset_impulse_state(n_cells):
+    """Stato iniziale del modello fisico 'impulso semplice' (Smith-Witkin-
+    Baraff): vel/strain/broken/pos_offset per ogni cella - fattorizzato qui
+    per essere riusato identico in render_voronoi, nel combo con Capillary
+    e in Total Chaos, invece di duplicarlo in ognuna."""
+    return (np.zeros((n_cells, 2), dtype=np.float32),  # vel
+            np.zeros(n_cells, dtype=np.float32),        # strain
+            np.zeros(n_cells, dtype=bool),              # broken
+            np.zeros((n_cells, 2), dtype=np.float32))   # pos_offset
+
+
+def voronoi_reset_pbd_state(pts, anchor_frac=0.2):
+    """Stato iniziale del modello Position Based Dynamics: rete di vincoli
+    (Delaunay sui punti Voronoi) + un sottoinsieme di celle ancorate.
+    Fattorizzato per lo stesso motivo di voronoi_reset_impulse_state."""
+    n_cells = len(pts)
+    edges, rest_len = build_delaunay_edges(pts)
+    cy_c = pts.mean(axis=0)
+    dist_c = np.linalg.norm(pts - cy_c, axis=1)
+    n_anchor = max(int(n_cells * anchor_frac), 1)
+    anchor_idx = np.argsort(dist_c)[-n_anchor:]
+    inv_mass = np.ones(n_cells, dtype=np.float32)
+    inv_mass[anchor_idx] = 0.0
+    return (pts.copy().astype(np.float32),              # pos
+            np.zeros((n_cells, 2), dtype=np.float32),    # vel
+            edges, rest_len,
+            np.zeros(len(edges), dtype=bool),            # broken
+            inv_mass)
+
+
 def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_frames,
                     seed, base_intensity, n_points, growth_rate, writer,
                     mode_score=0.0, complexity_score=0.5, physics_mode="none",
                     break_threshold=0.4, damping=0.90,
-                    pbd_compliance=280.0, pbd_break_stretch=0.045, pbd_anchor_frac=0.2):
+                    pbd_compliance=280.0, pbd_break_stretch=0.09, pbd_anchor_frac=0.2):
     """Scrive ogni frame direttamente su `writer` (niente accumulo in RAM).
     I punti/celle Voronoi si ricalcolano solo ai beat (costoso), non ogni
     frame (economico): stesso identico risultato visivo, molto meno CPU.
@@ -1609,32 +1830,11 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
     cache_rng = np.random.default_rng(seed)
     points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
 
-    def _reset_impulse_state(n_cells):
-        return (np.zeros((n_cells, 2), dtype=np.float32),  # vel
-                np.zeros(n_cells, dtype=np.float32),        # strain
-                np.zeros(n_cells, dtype=bool),              # broken
-                np.zeros((n_cells, 2), dtype=np.float32))   # pos_offset
-
-    def _reset_pbd_state(pts):
-        n_cells = len(pts)
-        edges, rest_len = build_delaunay_edges(pts)
-        cy_c = pts.mean(axis=0)
-        dist_c = np.linalg.norm(pts - cy_c, axis=1)
-        n_anchor = max(int(n_cells * pbd_anchor_frac), 1)
-        anchor_idx = np.argsort(dist_c)[-n_anchor:]
-        inv_mass = np.ones(n_cells, dtype=np.float32)
-        inv_mass[anchor_idx] = 0.0
-        return (pts.copy().astype(np.float32),              # pos
-                np.zeros((n_cells, 2), dtype=np.float32),    # vel
-                edges, rest_len,
-                np.zeros(len(edges), dtype=bool),            # broken
-                inv_mass)
-
     if physics_mode == "impulse":
-        vel, strain, broken, pos_offset = _reset_impulse_state(len(points))
+        vel, strain, broken, pos_offset = voronoi_reset_impulse_state(len(points))
     elif physics_mode == "pbd":
         pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
-            _reset_pbd_state(points)
+            voronoi_reset_pbd_state(points, pbd_anchor_frac)
 
     for f in range(total_frames):
         eb, em, eh_ = float(env_bass[f]), float(env_mid[f]), float(env_high[f])
@@ -1646,10 +1846,10 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             cache_rng = np.random.default_rng(seed + seed_offset)
             points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
             if physics_mode == "impulse":
-                vel, strain, broken, pos_offset = _reset_impulse_state(len(points))
+                vel, strain, broken, pos_offset = voronoi_reset_impulse_state(len(points))
             elif physics_mode == "pbd":
                 pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
-                    _reset_pbd_state(points)
+                    voronoi_reset_pbd_state(points, pbd_anchor_frac)
 
         # bassi: intensita' della frattura, con colpo secco sul beat
         intensity = 0.1 + base_intensity * (growth_acc * 0.5 + eb * 0.5)
@@ -1701,7 +1901,8 @@ def render_voronoi(base_img, region_mask, env_bass, env_mid, env_high, beat_fram
             pbd_pos, pbd_vel, pbd_broken = xpbd_fracture_step(
                 pbd_pos, pbd_vel, pbd_rest_len, pbd_edges, pbd_broken, pbd_inv_mass,
                 impact_center, impact_force, compliance=pbd_compliance,
-                break_stretch=pbd_break_stretch, damping=damping)
+                break_stretch=pbd_break_stretch, damping=damping,
+                scale=max(base_img.shape[:2]) / 720.0)
 
             offset = pbd_pos - points
             disp_override = (offset[:, 0], offset[:, 1])
@@ -1838,7 +2039,10 @@ def crack_seeds_from_labels(labels, n_seeds, rng, w, h):
 
 def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env_high,
                                     beat_frames, seed, base_intensity, n_points,
-                                    growth_rate, writer, mode_score=0.0, complexity_score=0.5):
+                                    growth_rate, writer, mode_score=0.0, complexity_score=0.5,
+                                    physics_mode="none", break_threshold=0.4, damping=0.90,
+                                    pbd_compliance=280.0, pbd_break_stretch=0.09,
+                                    pbd_anchor_frac=0.2):
     h, w = base_img.shape[:2]
     total_frames = len(env_bass)
     growth_acc = 0.0
@@ -1847,6 +2051,12 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
 
     cache_rng = np.random.default_rng(seed)
     points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+
+    if physics_mode == "impulse":
+        vel, strain, broken, pos_offset = voronoi_reset_impulse_state(len(points))
+    elif physics_mode == "pbd":
+        pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
+            voronoi_reset_pbd_state(points, pbd_anchor_frac)
 
     n_walkers = max(n_points, 20)
     walker_pos = crack_seeds_from_labels(labels, n_walkers, rng, w, h)
@@ -1875,6 +2085,11 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
             seed_offset += 1
             cache_rng = np.random.default_rng(seed + seed_offset)
             points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points, cache_rng)
+            if physics_mode == "impulse":
+                vel, strain, broken, pos_offset = voronoi_reset_impulse_state(len(points))
+            elif physics_mode == "pbd":
+                pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
+                    voronoi_reset_pbd_state(points, pbd_anchor_frac)
             new_seeds = crack_seeds_from_labels(labels, 5, rng, w, h)
             walker_pos = np.concatenate([walker_pos, new_seeds], axis=0)
             walker_dir = np.concatenate(
@@ -1885,9 +2100,50 @@ def render_voronoi_capillary_combo(base_img, region_mask, env_bass, env_mid, env
             frac_intensity *= 1.6
 
         disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
-        fractured = apply_voronoi_displacement(base_img, points, labels, boxes, frac_intensity, disp_rng,
-                                                mode_score=mode_score,
-                                                complexity_score=complexity_score)
+
+        if physics_mode == "impulse":
+            cx, cy = points[:, 0].mean(), points[:, 1].mean()
+            fall_bias = 0.7 + max(-mode_score, 0.0) * 0.6
+            impact_force = eb * base_intensity * 260.0
+            if f in beat_frames:
+                impact_force *= 2.2
+            dx_p = points[:, 0] - cx
+            dy_p = points[:, 1] - cy
+            dist_p = np.sqrt(dx_p * dx_p + dy_p * dy_p) + 1.0
+            dirx, diry = dx_p / dist_p, dy_p / dist_p
+            local_force = impact_force / dist_p
+            strain += local_force
+            broken |= (~broken) & (strain > break_threshold * 120.0)
+            active = broken
+            vel[active, 0] = vel[active, 0] * damping + dirx[active] * local_force[active] * 0.06
+            vel[active, 1] = (vel[active, 1] * damping + diry[active] * local_force[active] * 0.06
+                               + fall_bias * 0.12)
+            pos_offset[active] += vel[active]
+            pos_offset[active] += disp_rng.uniform(-1.5, 1.5, (int(active.sum()), 2)) * \
+                                   (0.5 + complexity_score)
+            fractured = apply_voronoi_displacement(
+                base_img, points, labels, boxes, frac_intensity, disp_rng,
+                mode_score=mode_score, complexity_score=complexity_score,
+                disp_override=(pos_offset[:, 0], pos_offset[:, 1]))
+        elif physics_mode == "pbd":
+            impact_center = points.mean(axis=0)
+            impact_force = eb * base_intensity * 220.0
+            if f in beat_frames:
+                impact_force *= 2.5
+            pbd_pos, pbd_vel, pbd_broken = xpbd_fracture_step(
+                pbd_pos, pbd_vel, pbd_rest_len, pbd_edges, pbd_broken, pbd_inv_mass,
+                impact_center, impact_force, compliance=pbd_compliance,
+                break_stretch=pbd_break_stretch, damping=damping,
+                scale=max(base_img.shape[:2]) / 720.0)
+            offset = pbd_pos - points
+            fractured = apply_voronoi_displacement(
+                base_img, points, labels, boxes, frac_intensity, disp_rng,
+                mode_score=mode_score, complexity_score=complexity_score,
+                disp_override=(offset[:, 0], offset[:, 1]))
+        else:
+            fractured = apply_voronoi_displacement(base_img, points, labels, boxes, frac_intensity, disp_rng,
+                                                    mode_score=mode_score,
+                                                    complexity_score=complexity_score)
 
         step_size = 1.0 + 2.5 * em
         xi = np.clip(walker_pos[:, 0].astype(int), 0, w - 1)
@@ -2092,7 +2348,9 @@ _CHAOS_THRESH_GLITCH = 0.70
 def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
                         beat_frames, seed, base_intensity, growth_rate, writer,
                         mode_score=0.0, complexity_score=0.5, smile_override=None,
-                        desync_amount=0.0):
+                        desync_amount=0.0, use_mls=False, physics_mode="none",
+                        break_threshold=0.4, damping=0.90,
+                        pbd_compliance=280.0, pbd_break_stretch=0.09, pbd_anchor_frac=0.2):
     """Tutte le tecniche insieme: mesh anatomica sempre attiva (se c'e' un
     volto), poi Voronoi/Capillary/Liquid Drag/Glitch Slice si accendono uno
     alla volta man mano che l'energia audio accumulata (growth_acc) supera
@@ -2108,8 +2366,9 @@ def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
     has_face = pts is not None
     if has_face:
         all_src_pts, hull_expanded = build_face_mesh_points(pts, base_img.shape)
-        triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
-        src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
+        if not use_mls:
+            triangles_idx = get_delaunay_triangle_indices((0, 0, w, h), all_src_pts)
+            src_data = precompute_triangle_src_data(base_img, all_src_pts, triangles_idx)
         eye_r_center = tuple(pts[LANDMARK_GROUPS["eye_r"]].mean(axis=0))
         eye_l_center = tuple(pts[LANDMARK_GROUPS["eye_l"]].mean(axis=0))
         eye_width = float(np.linalg.norm(pts[36] - pts[39]))
@@ -2129,6 +2388,12 @@ def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
     cache_rng = np.random.default_rng(seed)
     points, labels, boxes = compute_voronoi_cells(base_img, region_mask, n_points_chaos, cache_rng)
     seed_offset = 0
+
+    if physics_mode == "impulse":
+        vel, strain, broken, pos_offset = voronoi_reset_impulse_state(len(points))
+    elif physics_mode == "pbd":
+        pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
+            voronoi_reset_pbd_state(points, pbd_anchor_frac)
 
     # Capillary: setup identico alla versione standalone ma con meno semi
     n_walkers_chaos = 20
@@ -2193,7 +2458,10 @@ def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
             for i in LANDMARK_GROUPS["jaw"][9:]:
                 displaced[i] = pts[i] + (displaced[i] - pts[i]) * asym_r
 
-            frame = warp_face_mesh_fast(frame, src_data, displaced, hull_expanded, triangles_idx)
+            if use_mls:
+                frame = warp_face_mls(frame, all_src_pts, displaced, hull_expanded)
+            else:
+                frame = warp_face_mesh_fast(frame, src_data, displaced, hull_expanded, triangles_idx)
 
             eye_bulge = float(np.clip(0.25 + eye_i * 0.9, 0.0, 0.9))
             frame = apply_bulge_roi(frame, eye_r_center, eye_radius, eye_bulge)
@@ -2217,11 +2485,53 @@ def render_total_chaos(base_img, pts, region_mask, env_bass, env_mid, env_high,
                 points_new, labels_new, boxes_new = compute_voronoi_cells(
                     base_img, region_mask, n_points_chaos, cache_rng2)
                 points, labels, boxes = points_new, labels_new, boxes_new
+                if physics_mode == "impulse":
+                    vel, strain, broken, pos_offset = voronoi_reset_impulse_state(len(points))
+                elif physics_mode == "pbd":
+                    pbd_pos, pbd_vel, pbd_edges, pbd_rest_len, pbd_broken, pbd_inv_mass = \
+                        voronoi_reset_pbd_state(points, pbd_anchor_frac)
             vor_intensity = (growth_acc - _CHAOS_THRESH_VORONOI) * base_intensity * 0.9
             disp_rng = np.random.default_rng(seed + seed_offset * 1000 + f)
-            frame = apply_voronoi_displacement(frame, points, labels, boxes, vor_intensity,
-                                                disp_rng, mode_score=mode_score,
-                                                complexity_score=complexity_score)
+
+            if physics_mode == "impulse":
+                cx_v, cy_v = points[:, 0].mean(), points[:, 1].mean()
+                fall_bias = 0.7 + max(-mode_score, 0.0) * 0.6
+                impact_force = eb * base_intensity * 260.0
+                if f in beat_frames:
+                    impact_force *= 2.2
+                dx_p = points[:, 0] - cx_v
+                dy_p = points[:, 1] - cy_v
+                dist_p = np.sqrt(dx_p * dx_p + dy_p * dy_p) + 1.0
+                local_force = impact_force / dist_p
+                strain += local_force
+                broken |= (~broken) & (strain > break_threshold * 120.0)
+                active = broken
+                vel[active, 0] = vel[active, 0] * damping + (dx_p / dist_p)[active] * local_force[active] * 0.06
+                vel[active, 1] = (vel[active, 1] * damping + (dy_p / dist_p)[active] * local_force[active] * 0.06
+                                   + fall_bias * 0.12)
+                pos_offset[active] += vel[active]
+                frame = apply_voronoi_displacement(
+                    frame, points, labels, boxes, vor_intensity, disp_rng,
+                    mode_score=mode_score, complexity_score=complexity_score,
+                    disp_override=(pos_offset[:, 0], pos_offset[:, 1]))
+            elif physics_mode == "pbd":
+                impact_force = eb * base_intensity * 220.0
+                if f in beat_frames:
+                    impact_force *= 2.5
+                pbd_pos, pbd_vel, pbd_broken = xpbd_fracture_step(
+                    pbd_pos, pbd_vel, pbd_rest_len, pbd_edges, pbd_broken, pbd_inv_mass,
+                    points.mean(axis=0), impact_force, compliance=pbd_compliance,
+                    break_stretch=pbd_break_stretch, damping=damping,
+                scale=max(base_img.shape[:2]) / 720.0)
+                offset = pbd_pos - points
+                frame = apply_voronoi_displacement(
+                    frame, points, labels, boxes, vor_intensity, disp_rng,
+                    mode_score=mode_score, complexity_score=complexity_score,
+                    disp_override=(offset[:, 0], offset[:, 1]))
+            else:
+                frame = apply_voronoi_displacement(frame, points, labels, boxes, vor_intensity,
+                                                    disp_rng, mode_score=mode_score,
+                                                    complexity_score=complexity_score)
 
         # 3) CAPILLARY BLEED - le venature crescono sempre "sotto traccia" ma
         # diventano visibili solo passata la soglia
@@ -2512,6 +2822,20 @@ def main():
                                       key="ad_explode")
             ad_tear = st.checkbox("Strappo a strisce / Strip tear", value=True,
                                    key="ad_tear")
+        ad_tear_mode = st.selectbox(
+            "Tipo di strappo / Tear type", ["strips", "crack"], index=0,
+            key="ad_tear_mode", disabled=not ad_tear,
+            help="'strips': strisce orizzontali che si staccano una alla "
+                 "volta, con direzione fissa. 'crack': una crepa unica che "
+                 "si propaga verso l'esterno da un punto vicino alla bocca, "
+                 "con la pelle che si stira ai bordi e si apre di piu' dove "
+                 "e' nata - percorso fisso, rivelato progressivamente. / "
+                 "'strips': horizontal strips detaching one at a time in a "
+                 "fixed direction. 'crack': a single crack propagating "
+                 "outward from a point near the mouth, skin stretching at "
+                 "the edges and opening wider where it started - a fixed "
+                 "path, revealed progressively.",
+        )
         ad_use_mls = st.checkbox(
             "Motore MLS (niente cuciture, piu' lento) / MLS engine "
             "(no seams, slower)",
@@ -2566,8 +2890,9 @@ def main():
     with st.expander("Voronoi Fracture",
                       expanded=(style_key in (STYLE_VORONOI, STYLE_COMBO))):
         if style_key == STYLE_COMBO:
-            st.caption("Usati anche dal combo Voronoi + Capillary. / "
-                       "Also used by the Voronoi + Capillary combo.")
+            st.caption("Usati anche dal combo Voronoi + Capillary, incluso il "
+                       "modello fisico. / Also used by the Voronoi + "
+                       "Capillary combo, physics model included.")
         vf_intensity = st.slider("Intensita' frattura / Fracture intensity", 0.2, 3.0, 1.0,
                                   0.1, key="vf_intensity")
         vf_points = st.slider("Numero placche / Number of pieces", 10, 60, 26, 2,
@@ -2617,7 +2942,7 @@ def main():
                  "translates as one block and never breaks.",
         )
         vf_pbd_break_stretch = st.slider(
-            "Stiramento di rottura (PBD) / Break stretch (PBD)", 0.02, 0.3, 0.045, 0.005,
+            "Stiramento di rottura (PBD) / Break stretch (PBD)", 0.02, 0.3, 0.09, 0.005,
             key="vf_pbd_break_stretch", disabled=(vf_physics_key != "pbd"),
         )
     with st.expander("Capillary Bleed", expanded=(style_key == STYLE_CAPILLARY)):
@@ -2647,6 +2972,17 @@ def main():
         )
         tc_intensity = st.slider("Intensita' complessiva / Overall intensity", 0.2, 3.0, 1.2,
                                   0.1, key="tc_intensity")
+        tc_use_mls = st.checkbox(
+            "Motore MLS per la mesh anatomica (niente cuciture, piu' lento) / "
+            "MLS engine for the anatomical mesh (no seams, slower)",
+            value=False, key="tc_use_mls",
+        )
+        st.caption(
+            "Il modello fisico del blocco Voronoi qui dentro segue la scelta "
+            "fatta nell'expander 'Voronoi Fracture' (Nessuno / Impulso / "
+            "PBD). / The physics model of the Voronoi block here follows "
+            "the choice made in the 'Voronoi Fracture' expander."
+        )
         tc_growth = st.slider("Velocita' collasso / Collapse rate", 0.3, 3.0, 1.0, 0.1,
                                key="tc_growth",
                                help="Piu' basso = il collasso totale arriva solo verso la "
@@ -2830,6 +3166,7 @@ def main():
                         enable_explode=ad_explode, enable_tear=ad_tear, use_mls=bool(ad_use_mls),
                         hole_fill=ad_hole_fill, use_perlin_corrosion=bool(ad_perlin_corrosion),
                         enable_pulse=bool(ad_enable_pulse), pulse_amplify=float(ad_pulse_amplify),
+                        tear_mode=ad_tear_mode,
                     )
                 elif style_key == STYLE_VORONOI:
                     render_voronoi(
@@ -2855,6 +3192,10 @@ def main():
                         int(seed), base_intensity=float(vf_intensity) * (0.5 + w_bass * 0.5),
                         n_points=int(vf_points), growth_rate=float(vf_growth), writer=writer,
                         mode_score=mode_score, complexity_score=complexity_score,
+                        physics_mode=vf_physics_key,
+                        break_threshold=float(vf_break_threshold),
+                        pbd_compliance=float(vf_pbd_compliance),
+                        pbd_break_stretch=float(vf_pbd_break_stretch),
                     )
                 elif style_key == STYLE_LIQUID_DRAG:
                     render_liquid_drag(
@@ -2876,7 +3217,11 @@ def main():
                         growth_rate=float(tc_growth), writer=writer, mode_score=mode_score,
                         complexity_score=complexity_score,
                         smile_override=None if aw_auto_smile else float(aw_smile_manual),
-                        desync_amount=float(aw_desync),
+                        desync_amount=float(aw_desync), use_mls=bool(tc_use_mls),
+                        physics_mode=vf_physics_key,
+                        break_threshold=float(vf_break_threshold),
+                        pbd_compliance=float(vf_pbd_compliance),
+                        pbd_break_stretch=float(vf_pbd_break_stretch),
                     )
                 else:
                     st.error("Stile non riconosciuto. / Unrecognized style.")
