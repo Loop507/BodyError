@@ -220,14 +220,22 @@ def _get_dlib_models():
     return detector, predictor
 
 
-def detect_landmarks(img_float_bgr):
+def detect_landmarks(img_float_bgr, debug=None):
     """Restituisce (68,2) landmark in coordinate pixel, o None se nessun volto
-    o se il modello dlib non e' disponibile (import fallito o download fallito)."""
+    o se il modello dlib non e' disponibile (import fallito o download fallito).
+    debug: se e' un dict, viene riempito con informazioni reali su cosa e'
+    successo ad ogni livello di tentativo (quanti volti trovati, con che
+    punteggio) - senza questo, un fallimento e' una scatola nera: si puo'
+    solo ispezionare la foto e indovinare la causa, non verificarla."""
+    if debug is not None:
+        debug["dlib_ok"] = DLIB_OK
     if not DLIB_OK:
         return None
     try:
         detector, predictor = _get_dlib_models()
     except Exception as exc:
+        if debug is not None:
+            debug["model_load_error"] = str(exc)
         st.warning(
             f"Impossibile caricare il modello dei landmark del volto: {exc} / "
             f"Could not load the face landmark model: {exc}"
@@ -235,13 +243,19 @@ def detect_landmarks(img_float_bgr):
         return None
     img_u8 = (np.clip(img_float_bgr, 0, 1) * 255).astype(np.uint8)
     gray = cv2.cvtColor(img_u8, cv2.COLOR_BGR2GRAY)
+    if debug is not None:
+        debug["image_shape_hw"] = gray.shape
 
     # primo tentativo veloce (upsample=1); se non trova nulla, riprova con
     # upsample piu' aggressivo (piu' lento ma piu' robusto su crop stretti
     # o volti piccoli nel frame, es. aspect ratio molto larghi/stretti)
     faces = detector(gray, 1)
+    if debug is not None:
+        debug["tier1_upsample1_found"] = len(faces)
     if len(faces) == 0:
         faces = detector(gray, 2)
+        if debug is not None:
+            debug["tier2_upsample2_found"] = len(faces)
     if len(faces) == 0:
         # ultima risorsa: detector.run() permette di abbassare la soglia di
         # decisione dell'SVM (adjust_threshold, default 0.0) - alcuni volti
@@ -252,6 +266,9 @@ def detect_landmarks(img_float_bgr):
         # geometrica molto estrema (proporzioni del tutto diverse da un
         # volto umano normale), ma aiuta nei casi limite.
         dets, scores, _ = detector.run(gray, 2, -1.0)
+        if debug is not None:
+            debug["tier3_lowered_threshold_found"] = len(dets)
+            debug["tier3_scores"] = [round(float(sc), 3) for sc in scores]
         if len(dets) > 0:
             best = int(np.argmax(scores))
             faces = [dets[best]]
@@ -262,16 +279,20 @@ def detect_landmarks(img_float_bgr):
     return pts
 
 
-def detect_landmarks_at_resolution(img_path, target_w, target_h):
+def detect_landmarks_at_resolution(img_path, target_w, target_h, debug=None):
     """Rileva i landmark sull'immagine ORIGINALE intera (il rilevamento e'
     molto piu' affidabile a piena inquadratura che su crop stretti/piccoli),
     poi proietta i punti nelle coordinate del crop+resize finale."""
     orig = cv2.imread(img_path)
     if orig is None:
+        if debug is not None:
+            debug["imread_failed"] = True
         return None
     oh, ow = orig.shape[:2]
+    if debug is not None:
+        debug["orig_shape_hw"] = (oh, ow)
     orig_float = orig.astype(np.float32) / 255.0
-    pts = detect_landmarks(orig_float)
+    pts = detect_landmarks(orig_float, debug=debug)
     if pts is None:
         return None
 
@@ -3117,13 +3138,34 @@ def main():
             base_img = load_image_fit_aspect(img_path, render_w, render_h)
 
             progress.progress(25, text=progress_label_prefix + "Rilevamento volto / Face detection...")
-            pts = detect_landmarks_at_resolution(img_path, render_w, render_h)
+            face_debug = {}
+            pts = detect_landmarks_at_resolution(img_path, render_w, render_h, debug=face_debug)
             if pts is None:
                 st.warning(
                     "Nessun volto rilevato: gli stili basati sui landmark saranno "
                     "limitati. / No face detected: landmark-based styles will be "
                     "limited."
                 )
+                with st.expander("Diagnostica rilevamento volto / Face detection diagnostics"):
+                    st.json(face_debug)
+                    st.caption(
+                        "Se 'tier1_upsample1_found' e' 0 e anche gli altri livelli "
+                        "sono 0 o assenti, il modello non ha trovato nulla di "
+                        "simile a un volto neanche abbassando la soglia - la foto "
+                        "probabilmente ha una posa/proporzioni troppo estreme per "
+                        "il rilevatore. Se invece 'dlib_ok' e' false o compare "
+                        "'model_load_error', il problema e' a monte del "
+                        "rilevamento stesso (dlib non disponibile o modello non "
+                        "caricato) e non ha a che fare con la foto. / If "
+                        "'tier1_upsample1_found' is 0 and the other tiers are 0 "
+                        "or absent, the model found nothing face-like even with "
+                        "a lowered threshold - the photo's pose/proportions are "
+                        "likely too extreme for the detector. If instead "
+                        "'dlib_ok' is false or 'model_load_error' appears, the "
+                        "problem is upstream of detection itself (dlib "
+                        "unavailable or model not loaded) and has nothing to do "
+                        "with the photo."
+                    )
 
             region_mask = build_background_subject_mask(base_img)
 
