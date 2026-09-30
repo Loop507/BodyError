@@ -1369,7 +1369,7 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                                    enable_explode=True, enable_tear=True, use_mls=False,
                                    hole_fill="inpaint", use_perlin_corrosion=True,
                                    enable_pulse=False, pulse_amplify=10.0, pulse_level=2,
-                                   tear_mode="strips"):
+                                   tear_mode="strips", preview_only=False):
     """Stessa mesh anatomica di Anatomical Warp come base, ma superate
     soglie crescenti di energia accumulata (growth_acc, monotona) le
     feature vengono DANNEGGIATE in modo permanente invece di deformate
@@ -1447,6 +1447,7 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                                       np.random.default_rng(seed + 555))
         crack_ctx = {
             "path": crack_path, "n": n_crack, "revealed": 0, "cache": None,
+            "revealed_target": 0,
             "burst": 0.0, "open": 0.0, "scale": scale_px,
             "max_gap": 30.0 * scale_px * min(max(base_intensity, 0.5), 1.5),
             "falloff": 45.0 * scale_px, "rough_px": 5.0 * scale_px,
@@ -1481,14 +1482,64 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
         avg_e = (eb + em + eh_) / 3.0
         growth_acc = min(1.0, growth_acc + (avg_e / total_frames) * growth_rate)
 
+        # in preview_only si produce l'immagine SOLO sull'ultimo frame: per
+        # tutti gli altri si aggiorna solo lo stato numerico (economico -
+        # nessuna operazione su immagini), che e' cio' che serve per sapere
+        # a che punto sia arrivata la distruzione a fine brano. E' lo stesso
+        # principio della cache gia' usata altrove nel file: non rifare un
+        # lavoro costoso quando il risultato finale e' l'unica cosa che
+        # serve vedere.
+        produce_image = (not preview_only) or (f == total_frames - 1)
+
+        # innesco esplosione bocca: solo la rilevazione del PRIMO frame in
+        # cui scatta e' stato che serve conservare; il resto (landmark
+        # spostati, jitter) si calcola solo quando si produce l'immagine
+        if enable_explode and growth_acc >= thr_mouth and frame_mouth_trigger is None:
+            frame_mouth_trigger = f
+
+        # stato dello strappo: sempre aggiornato (piccoli array, nessuna
+        # immagine coinvolta) - cache/immagine vera rimandate sotto
+        if enable_tear and crack_ctx is not None:
+            if growth_acc >= thr_tear:
+                prog = (growth_acc - thr_tear) / max(1.0 - thr_tear, 1e-6)
+                crack_ctx["burst"] = min(0.3, crack_ctx["burst"] +
+                                          0.03 * eb * (2.0 if f in beat_frames else 1.0))
+                frac = min(1.0, 0.15 + 0.7 * prog + crack_ctx["burst"])
+                target_n = max(int(round(frac * crack_ctx["n"])), 2)
+                crack_ctx["revealed_target"] = max(crack_ctx["revealed_target"], target_n)
+                crack_ctx["open"] = max(crack_ctx["open"], 0.3 + 0.7 * prog)
+        elif enable_tear:
+            mx, my, mw, mh = mouth_bbox
+            strip_zone_h = mh - mh // 3
+            strip_h = max(strip_zone_h // n_tear_strips, 1)
+            strip_centers_y = (my + mh // 3) + (np.arange(n_tear_strips) + 0.5) * strip_h
+            dist_from_epicenter = np.abs(strip_centers_y - mouth_center[1]) + 1.0
+            impact_force = eb * base_intensity * 90.0
+            if f in beat_frames:
+                impact_force *= 2.0
+            local_force = impact_force / dist_from_epicenter
+            if growth_acc >= thr_tear:
+                tear_strain += local_force
+                newly = (~tear_broken) & (tear_strain > 300.0)
+                tear_broken |= newly
+            if tear_broken.any():
+                active = tear_broken
+                tear_vel[active] = tear_vel[active] * 0.92 + \
+                    tear_dir[active] * local_force[active] * 0.15
+                tear_offset[active] += tear_vel[active]
+
+        if not produce_image:
+            continue
+
+        # --- da qui in poi solo per il frame che va davvero prodotto: in
+        # un render normale e' OGNI frame (produce_image e' sempre True),
+        # in preview_only e' solo l'ultimo. ---
         displaced = pts.copy()
         frame_src = base_img
 
         # 1) esplosione bocca: se innescata, agisce sui landmark PRIMA del
         # warp della mesh (quindi passa dentro warp_face_mesh_fast)
         if enable_explode and growth_acc >= thr_mouth:
-            if frame_mouth_trigger is None:
-                frame_mouth_trigger = f
             t_since = f - frame_mouth_trigger
             displaced = explode_group(displaced, LANDMARK_GROUPS["mouth"], mouth_center,
                                        t_since, rng, accel=0.01 * base_intensity)
@@ -1531,58 +1582,32 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
             frame = dislocate_feature(frame, nose_mask, nose_offset, hole_fill=hole_fill,
                                        precomputed_fill=nose_fill_cache)
 
-        # 4) strappo a strisce sulla meta' inferiore del volto: come le
-        # celle Voronoi, ogni striscia accumula tensione in base alla
-        # distanza dall'epicentro (il centro della bocca) e all'energia dei
-        # bassi/beat; supera la sua soglia -> si rompe per sempre e da quel
-        # momento si muove con inerzia vera, nella sua direzione fissa
-        # (mai piu' ricalcolata a caso ad ogni frame)
+        # 4) strappo: la cache/immagine vera si costruisce solo qui, con lo
+        # stato (revealed_target / tear_offset) accumulato sopra per tutti
+        # i frame - in preview_only questo succede una sola volta in totale
+        # invece che fino a ~48 volte durante il video (crack) o ad ogni
+        # frame (strips)
         if enable_tear and crack_ctx is not None:
-            if growth_acc >= thr_tear:
-                prog = (growth_acc - thr_tear) / max(1.0 - thr_tear, 1e-6)
-                crack_ctx["burst"] = min(0.3, crack_ctx["burst"] +
-                                          0.03 * eb * (2.0 if f in beat_frames else 1.0))
-                frac = min(1.0, 0.15 + 0.7 * prog + crack_ctx["burst"])
-                target_n = max(int(round(frac * crack_ctx["n"])), 2)
-                if target_n > crack_ctx["revealed"]:  # solo in avanti, mai indietro
+            if crack_ctx["revealed_target"] > 0:
+                target_n = crack_ctx["revealed_target"]
+                if target_n > crack_ctx["revealed"] or crack_ctx["cache"] is None:
                     crack_ctx["revealed"] = target_n
                     pad = crack_ctx["max_gap"] / 2 + crack_ctx["falloff"] + 10
                     crack_ctx["cache"] = tear_build_cache(
                         crack_ctx["path"], target_n, base_img.shape, pad,
                         rough_field=crack_ctx["rough"])
-                crack_ctx["open"] = max(crack_ctx["open"], 0.3 + 0.7 * prog)
                 openness = min(1.0, crack_ctx["open"] + 0.15 * eb)
                 frame = tear_apply(frame, crack_ctx["cache"], openness,
                                     crack_ctx["max_gap"], crack_ctx["falloff"],
                                     np.array([0.05, 0.02, 0.35], dtype=np.float32),
                                     rough_px=crack_ctx["rough_px"],
                                     smooth_sigma=3.0)
-        elif enable_tear:
+        elif enable_tear and tear_broken.any():
             mx, my, mw, mh = mouth_bbox
             strip_zone_h = mh - mh // 3
-            strip_h = max(strip_zone_h // n_tear_strips, 1)
-            strip_centers_y = (my + mh // 3) + (np.arange(n_tear_strips) + 0.5) * strip_h
-            dist_from_epicenter = np.abs(strip_centers_y - mouth_center[1]) + 1.0
-
-            impact_force = eb * base_intensity * 90.0
-            if f in beat_frames:
-                impact_force *= 2.0
-            local_force = impact_force / dist_from_epicenter
-
-            if growth_acc >= thr_tear:
-                tear_strain += local_force
-                newly = (~tear_broken) & (tear_strain > 300.0)
-                tear_broken |= newly
-
-            if tear_broken.any():
-                active = tear_broken
-                tear_vel[active] = tear_vel[active] * 0.92 + \
-                    tear_dir[active] * local_force[active] * 0.15
-                tear_offset[active] += tear_vel[active]
-
-                bleed = np.array([0.05, 0.02, 0.35], dtype=np.float32)
-                frame = tear_strips(frame, mx - 10, my + mh // 3, mw + 20, strip_zone_h,
-                                     n_tear_strips, tear_offset.tolist(), bleed)
+            bleed = np.array([0.05, 0.02, 0.35], dtype=np.float32)
+            frame = tear_strips(frame, mx - 10, my + mh // 3, mw + 20, strip_zone_h,
+                                 n_tear_strips, tear_offset.tolist(), bleed)
 
         # polso pre-distruzione: solo prima che scatti il primo danno reale
         # (thr_eye) - l'attesa/il presagio prima che il corpo ceda davvero
@@ -1591,8 +1616,15 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
                                     amplify=pulse_amplify)
 
         frame = clinical_grade(frame)
+
+        if preview_only:
+            return np.clip(frame, 0, 1).astype(np.float32)
+
         frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         writer.write(frame_u8)
+
+    if preview_only:
+        return None  # total_frames == 0, caso degenere
 
 
 # ---------------------------------------------------------------------------
@@ -3115,6 +3147,31 @@ def main():
                  "before the full render. Uses more CPU than a low-res preview.",
         )
 
+    max_destruction_clicked = False
+    if style_key == STYLE_DESTRUCTION:
+        max_destruction_clicked = st.button(
+            "Anteprima: frame a distruzione massima / Preview: max-destruction frame",
+            key="button_max_destruction",
+            help="Un solo fotogramma che mostra come sara' l'immagine a fine "
+                 "brano (energia audio accumulata per tutta la durata scelta), "
+                 "saltando le operazioni costose sui frame intermedi - molto "
+                 "piu' rapido di un render completo, ma e' un singolo fermo "
+                 "immagine, non un video. Se e' attiva l'esplosione bocca, il "
+                 "tremore fine della bocca sara' leggermente diverso da quello "
+                 "che si vedrebbe nell'ultimo frame di un render completo "
+                 "(stesso ammontare di danno, jitter casuale diverso) - tutto "
+                 "il resto (corrosione, dislocazione, strappo) e' identico. / "
+                 "A single frame showing how the image will look by the end of "
+                 "the track (audio energy accumulated over the whole chosen "
+                 "duration), skipping expensive work on intermediate frames - "
+                 "much faster than a full render, but it's a single still "
+                 "frame, not a video. If mouth explosion is on, its fine jitter "
+                 "will differ slightly from what a full render's last frame "
+                 "would show (same amount of damage, different random jitter) "
+                 "- everything else (corrosion, dislocation, tear) is "
+                 "identical.",
+        )
+
     def do_render(render_w, render_h, render_duration, output_key, report_key,
                    progress_label_prefix="", is_official=True):
         if image_file is None:
@@ -3324,8 +3381,88 @@ def main():
 
             progress.progress(100, text=progress_label_prefix + "Completato / Done")
 
+    def do_max_destruction_preview():
+        """Un solo fotogramma allo stato di distruzione massima raggiunto a
+        fine brano, invece di un video: stessa analisi audio/rilevamento
+        volto di do_render, ma render_anatomical_destruction viene chiamata
+        con preview_only=True, che salta le operazioni costose (warp,
+        corrosione, dislocazione, strappo) su tutti i frame tranne l'ultimo -
+        molto piu' rapido di un render completo per vedere solo il risultato
+        finale."""
+        if image_file is None:
+            st.error("Carica una foto prima di procedere. / Upload a photo first.")
+            return
+        if not DLIB_OK:
+            st.error("dlib non disponibile: impossibile procedere. / "
+                      "dlib not available: cannot proceed.")
+            return
+
+        st.session_state["max_destruction_frame"] = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img_path = os.path.join(tmpdir, "input.jpg")
+            with open(img_path, "wb") as fh:
+                fh.write(image_file.getvalue())
+
+            audio_path = None
+            if audio_file is not None:
+                audio_path = os.path.join(tmpdir, "input_audio.mp3")
+                with open(audio_path, "wb") as fh:
+                    fh.write(audio_file.getvalue())
+
+            with st.spinner("Calcolo stato a fine brano / Computing end-of-track state..."):
+                mode_score, complexity_score = 0.0, 0.5
+                if audio_path is not None and LIBROSA_OK:
+                    env_bass, env_mid, env_high, beat_frames, _ = analyze_audio_bands(
+                        audio_path, fps, duration_sec)
+                    mode_score, complexity_score = analyze_audio_character(audio_path, duration_sec)
+                else:
+                    if audio_path is not None and not LIBROSA_OK:
+                        st.warning("librosa non disponibile: uso envelope sintetico. / "
+                                   "librosa unavailable: using synthetic envelope.")
+                    env_bass, env_mid, env_high, beat_frames, _ = synthetic_bands(
+                        fps, duration_sec)
+
+                base_img = load_image_fit_aspect(img_path, target_w, target_h)
+                face_debug = {}
+                pts = detect_landmarks_at_resolution(img_path, target_w, target_h, debug=face_debug)
+                if pts is None:
+                    st.warning(
+                        "Nessun volto rilevato: impossibile generare l'anteprima "
+                        "di Anatomical Destruction. / No face detected: cannot "
+                        "generate the Anatomical Destruction preview."
+                    )
+                    with st.expander("Diagnostica rilevamento volto / Face detection diagnostics"):
+                        st.json(face_debug)
+                    return
+
+                frame = render_anatomical_destruction(
+                    base_img, pts, env_bass, env_mid, env_high, beat_frames, int(seed),
+                    base_intensity=float(ad_intensity), growth_rate=float(ad_growth),
+                    writer=None, mode_score=mode_score, complexity_score=complexity_score,
+                    enable_corrode=ad_corrode, enable_dislocate=ad_dislocate,
+                    enable_explode=ad_explode, enable_tear=ad_tear, use_mls=bool(ad_use_mls),
+                    hole_fill=ad_hole_fill, use_perlin_corrosion=bool(ad_perlin_corrosion),
+                    enable_pulse=bool(ad_enable_pulse), pulse_amplify=float(ad_pulse_amplify),
+                    tear_mode=ad_tear_mode, preview_only=True,
+                )
+                if frame is not None:
+                    frame_u8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+                    st.session_state["max_destruction_frame"] = cv2.cvtColor(
+                        frame_u8, cv2.COLOR_BGR2RGB)
+
     if render_clicked:
         do_render(target_w, target_h, duration_sec, "output_path", "report_text")
+
+    if max_destruction_clicked:
+        do_max_destruction_preview()
+
+    if st.session_state.get("max_destruction_frame") is not None:
+        st.caption(
+            "Frame a distruzione massima (fine brano) / Max-destruction frame "
+            "(end of track)"
+        )
+        st.image(st.session_state["max_destruction_frame"])
 
     if preview_clicked:
         # anteprima breve (5s) ma alla risoluzione PIENA scelta sopra, cosi'
