@@ -1507,7 +1507,14 @@ def render_anatomical_destruction(base_img, pts, env_bass, env_mid, env_high, be
             eye_growth_px += eh_ * 2.0
             if corrosion_field_a is not None:
                 # oscillazione lenta (un ciclo completo ogni ~200 frame)
-                t_mix = 0.5 + 0.5 * np.sin(f * 2.0 * np.pi / 200.0)
+                # float() e' essenziale qui: np.sin() su uno scalare python
+                # restituisce un numpy.float64, e un campo float32 moltiplicato
+                # per un numpy.float64 (non un python float) viene promosso
+                # per intero a float64 - da qui si propagava fino a
+                # clinical_grade, dove cv2.cvtColor non accetta CV_64F e
+                # l'app andava in crash con un errore oscurato da Streamlit
+                # Cloud. Bug reale, scovato facendo girare il render vero.
+                t_mix = float(0.5 + 0.5 * np.sin(f * 2.0 * np.pi / 200.0))
                 corrosion_field = corrosion_field_a * (1.0 - t_mix) + corrosion_field_b * t_mix
             else:
                 corrosion_field = None
